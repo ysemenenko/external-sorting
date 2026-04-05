@@ -22,13 +22,101 @@ ExternalSorting.Core/
     └── DataGenerator          — random test data generation
 ```
 
-### Algorithm
+### Algorithm: K-Way External Merge Sort
 
-1. **Chunk Phase**: Read input in chunks that fit in memory → sort each chunk in-memory → write to temp file
-2. **Merge Phase**: K-way merge using binary min-heap. Each pass merges K chunks into 1. Repeat until single sorted file remains.
-3. **Cleanup**: All temp files cleaned up automatically (even on failure)
+External merge sort handles datasets that don't fit in RAM by splitting the work into two phases: **chunk creation** (fits in memory) and **multi-pass merging** (disk-based).
 
-**Complexity**: O(N log N) comparisons, O(N/M × log(N/M) / log(K)) I/O passes
+#### Phase 1 — Chunk Creation
+
+```
+Input stream (N items, unsorted)
+        │
+        ▼
+┌─────────────────────────────┐
+│  Read M items into memory   │  M = MaxMemoryBytes / EstimatedItemSize
+│  Sort in-memory (Array.Sort)│  O(M log M) per chunk
+│  Write sorted chunk to disk │  Binary format with item count header
+└─────────────────────────────┘
+        │ repeat until input exhausted
+        ▼
+Chunk₀  Chunk₁  Chunk₂  ...  Chunk_{C-1}     (C = ⌈N/M⌉ chunks)
+```
+
+Each chunk is a self-contained binary file: `[int32: count][item₀][item₁]...[item_{M-1}]`.
+
+#### Phase 2 — K-Way Merge
+
+Merge K sorted chunks at a time using a **binary min-heap** of size K:
+
+```
+Pass 0: C chunks → ⌈C/K⌉ merged chunks
+Pass 1: ⌈C/K⌉ chunks → ⌈C/K²⌉ merged chunks
+...
+Pass P: 1 final sorted output
+
+Total passes: P = ⌈log_K(C)⌉
+```
+
+Each merge step:
+
+```
+Chunk A:  [1, 5, 9, ...]     ──┐
+Chunk B:  [2, 3, 8, ...]     ──┤
+Chunk C:  [4, 6, 7, ...]     ──┼──→  MinHeap (size K=3)  ──→  Output: [1, 2, 3, 4, 5, 6, ...]
+                                │
+                                │     ExtractMin: O(log K)
+                                │     Insert replacement from same chunk: O(log K)
+                                │     Total: O(N log K) per pass
+```
+
+**Why MinHeap?** The old implementation used `List.Sort()` on every extraction — O(K log K) per item, O(NK log K) total. MinHeap gives O(N log K), which is orders of magnitude faster for large K (8-way, 16-way merge).
+
+#### Concrete Example
+
+Sort 10M records with 64 MB memory, 8-way merge:
+
+```
+Input: 10,000,000 records (158 MB on disk)
+
+Phase 1 — Chunk Creation:
+  M = 64 MB / 48 bytes ≈ 1,300,000 items per chunk
+  C = ⌈10M / 1.3M⌉ = 8 chunks
+  Each chunk: ~20 MB, internally sorted
+
+  Chunk₀: [Apple:1, Apple:5, Banana:2, ...]     (1.3M items, sorted)
+  Chunk₁: [Apple:3, Cherry:8, Date:1, ...]      (1.3M items, sorted)
+  ...
+  Chunk₇: [Mango:4, Zucchini:9, ...]            (remaining items, sorted)
+
+Phase 2 — 8-Way Merge:
+  Pass 0: merge all 8 chunks in one pass (K=8 ≥ C=8)
+  
+  MinHeap seeded with first item from each chunk:
+  Heap: [(Apple:1, chunk0), (Apple:3, chunk1), ..., (Mango:4, chunk7)]
+  
+  Loop 10M times:
+    1. ExtractMin → smallest item across all chunks    O(log 8) = O(3)
+    2. Write to output
+    3. Read next item from same chunk, insert to heap  O(log 8) = O(3)
+  
+  Total comparisons: 10M × 2 × log₂(8) = 60M comparisons
+
+Result: single sorted file, 10M items in order
+Time: 9.8s (6.1s chunking + 3.3s merging)
+```
+
+#### Complexity
+
+| Metric | Formula | 10M example |
+|--------|---------|-------------|
+| Chunk count | C = ⌈N/M⌉ | 8 |
+| Merge passes | P = ⌈log_K(C)⌉ | 1 |
+| Comparisons per pass | O(N log K) | ~60M |
+| Total comparisons | O(N log K × P) | ~60M |
+| Disk I/O passes | P + 1 (chunk + merge) | 2 |
+| Total bytes read/written | O(N × (P + 1)) | ~316 MB × 2 |
+
+**Key insight**: Increasing K reduces passes (fewer disk I/O rounds) but increases heap operations per item. K=8 to K=16 is the sweet spot for most workloads — one merge pass handles up to K^1 = 8-16 chunks, and two passes handle up to K^2 = 64-256 chunks (billions of records).
 
 ## Quick Start
 
