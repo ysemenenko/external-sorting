@@ -30,6 +30,25 @@ ExternalSorting.Core/
 
 **Complexity**: O(N log N) comparisons, O(N/M × log(N/M) / log(K)) I/O passes
 
+## Quick Start
+
+```bash
+# Build
+dotnet build
+
+# Run tests (35 tests)
+dotnet test
+
+# Sort 100K records (quick check)
+dotnet run --project src/ExternalSorting.Console -- -n 100000 -m 8
+
+# Sort 1M records (release mode, faster)
+dotnet run --project src/ExternalSorting.Console -c Release -- -n 1000000 -m 16 -k 4
+
+# Sort 10M records (stress test)
+dotnet run --project src/ExternalSorting.Console -c Release -- -n 10000000 -m 64 -k 8
+```
+
 ## Usage
 
 ```bash
@@ -91,10 +110,11 @@ public class LogSerializer : ISerializer<LogEntry>
 
 ## Performance
 
-| Records | Memory | Merge | Time | Verified |
-|---------|--------|-------|------|----------|
-| 100K | 8 MB | 4-way | 0.1s | OK |
-| 1M | 16 MB | 8-way | 1.3s | OK |
+| Records | Memory | Merge | Chunks | Passes | Time | Verified |
+|---------|--------|-------|--------|--------|------|----------|
+| 100K | 8 MB | 4-way | 1 | 0 | 0.1s | OK |
+| 1M | 16 MB | 8-way | 3 | 1 | 1.3s | OK |
+| 10M | 64 MB | 8-way | 8 | 1 | 9.8s | OK |
 
 ## Tests
 
@@ -134,3 +154,14 @@ external-sorting/
 ## Requirements
 
 - .NET 8.0 SDK
+
+```bash
+# Ubuntu/Debian
+sudo apt-get install -y dotnet-sdk-8.0
+
+# macOS
+brew install dotnet-sdk
+
+# Verify
+dotnet --version
+```
