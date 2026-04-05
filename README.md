@@ -1,6 +1,10 @@
-# External Sorting
+# External Sorting in C# / .NET 8
 
-Enterprise-grade k-way external merge sort in .NET 8. Sorts datasets larger than available RAM using disk-based chunking and multi-way merge with a binary min-heap.
+Sort 1 GB of data with 1 MB of RAM. K-way external merge sort implementation using binary min-heap.
+
+Handles datasets larger than available memory by splitting input into sorted chunks on disk and merging them with O(N log K) k-way merge. Generic `IExternalSorter<T>` — plug in any record type, comparer, and serializer.
+
+**Keywords**: external sort, external merge sort, k-way merge, out-of-core sorting, large file sorting, limited memory sorting, disk-based sort, C#, .NET 8, binary min-heap
 
 ## Architecture
 
@@ -205,7 +209,7 @@ public class LogSerializer : ISerializer<LogEntry>
 | 10M | 158 MB | 64 MB | 8-way | 8 | 1 | 9.8s | OK |
 | **60M** | **948 MB** | **1 MB** | **8-way** | **2,747** | **4** | **84s** | **OK** |
 
-The last row demonstrates the core problem this project solves: **sort ~1 GB of data with only 1 MB of RAM**.
+The last row demonstrates the core interview problem: **sort 1 GB of data with only 1 MB of RAM** — a classic system design / algorithms challenge.
 
 ## Tests
 
