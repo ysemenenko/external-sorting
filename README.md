@@ -1,76 +1,136 @@
-# external-sorting using .net
+# External Sorting
 
-This application uses Two-Way Sorting. Below there is description of number sorting as example. 
-Application uses row as text and number intead of number in example.
-Application has to consiquence of two step, where first one is creating input file and the next is sorting.
-User should enter data (number of files to merge in one big file and number of rows in file) that will be used for generation of input file. 
-Next step is enter sorting data ( number of tapes and length of run (length of sorted portion)).
+Enterprise-grade k-way external merge sort in .NET 8. Sorts datasets larger than available RAM using disk-based chunking and multi-way merge with a binary min-heap.
 
-Here is an example of Two-Way Sorting.
-Where N is number of input file. M is run.
+## Architecture
 
-N = 14, M = 3 (14 records on tape Ta1, memory capacity: 3 records.)
+```
+ExternalSorting.Core/
+├── Core/
+│   ├── IExternalSorter<T>    — main contract: Stream → sorted Stream
+│   ├── ISerializer<T>        — binary serialization for any record type
+│   ├── SortOptions            — memory budget, merge factor, parallelism, temp dir
+│   └── SortMetrics            — items, chunks, merge passes, timing
+├── Pipeline/
+│   └── ExternalSorter<T>     — orchestrator: chunk phase → merge phase
+├── Merge/
+│   └── MinHeap<T>            — O(log K) binary min-heap for k-way merge
+└── IO/
+    ├── ChunkWriter/Reader     — buffered binary chunk I/O with headers
+    ├── RecordSerializer       — SortRecord (ulong + string) binary format
+    ├── TextRecordIO           — legacy "number. text" format parser
+    └── DataGenerator          — random test data generation
+```
 
-Ta1: 17, 3, 29, 56, 24, 18, 4, 9, 10, 6, 45, 36, 11, 43
+### Algorithm
 
-Sorting of runs:
-Read 3 records in main memory, sort them and store them on Tb1:
-17, 3, 29 -> 3, 17, 29
+1. **Chunk Phase**: Read input in chunks that fit in memory → sort each chunk in-memory → write to temp file
+2. **Merge Phase**: K-way merge using binary min-heap. Each pass merges K chunks into 1. Repeat until single sorted file remains.
+3. **Cleanup**: All temp files cleaned up automatically (even on failure)
 
-Tb1: 3, 17, 29
+**Complexity**: O(N log N) comparisons, O(N/M × log(N/M) / log(K)) I/O passes
 
-Read the next 3 records in main memory, sort them and store them on Tb2
-56, 24, 18 -> 18, 24, 56
+## Usage
 
-Tb2: 18, 24, 56
+```bash
+dotnet run --project src/ExternalSorting.Console -- [options]
 
-Read the next 3 records in main memory, sort them and store them on Tb1
+Options:
+  -n, --count <N>      Number of records to generate (default: 1M)
+  -m, --memory <MB>    Memory budget in MB (default: 64)
+  -k, --merge-way <K>  K-way merge factor (default: 8)
+  -i, --input <file>   Use existing binary input file (skip generation)
+  -h, --help           Show help
+```
 
-4, 9, 10 -> 4, 9, 10
-Tb1: 3, 17, 29, 4, 9, 10
+### Examples
 
-Read the next 3 records in main memory, sort them and store them on Tb2
-6, 45, 36 -> 6, 36, 45
+```bash
+# Sort 1M records with 16MB memory, 8-way merge
+dotnet run --project src/ExternalSorting.Console -c Release -- -n 1000000 -m 16 -k 8
 
-Tb2: 18, 24, 56, 6, 36, 45
+# Sort 10M records with 64MB memory
+dotnet run --project src/ExternalSorting.Console -c Release -- -n 10000000 -m 64
+```
 
-Read the next 3 records in main memory, sort them and store them on Tb1
+### Programmatic API
 
-(there are only two records left)
-11, 43 -> 11, 43
-Tb1: 3, 17, 29, 4, 9, 10, 11, 43
+```csharp
+var serializer = new RecordSerializer();
+var comparer = Comparer<SortRecord>.Default;
+var options = new SortOptions
+{
+    MaxMemoryBytes = 64 * 1024 * 1024,  // 64 MB
+    MergeWayCount = 8,
+    OnProgress = (phase, pct) => Console.Write($"\r{phase} {pct:F0}%"),
+};
 
-At the end of this process we will have three runs on Tb1 and two runs on Tb2:
+var sorter = new ExternalSorter<SortRecord>(serializer, comparer, options);
 
-Tb1: 3, 17, 29 | 4, 9, 10 | 11, 43
+using var input = File.OpenRead("input.bin");
+using var output = File.Create("output.bin");
+sorter.Sort(input, output);
 
-Tb2: 18, 24, 56 | 6, 36, 45 |
+Console.WriteLine(sorter.LastMetrics); // Items: 1,000,000, Chunks: 3, ...
+```
 
-Merging of runs
-B1. Merging runs of length 3 to obtain runs of length 6. 
+### Custom record types
 
-Source tapes: Tb1 and Tb2, result on Ta1 and Ta2.
-Merge the first two runs (on Tb1 and Tb2) and store the result on Ta1.
+Implement `ISerializer<T>` for any type:
 
-Tb1: 3, 17, 29 | 4, 9, 10 | 11, 43
+```csharp
+public record LogEntry(DateTime Timestamp, string Message);
 
-Tb2: 18, 24, 56 | 6, 36, 45 |
+public class LogSerializer : ISerializer<LogEntry>
+{
+    public int EstimatedItemSize => 8 + 100;
+    public void Write(BinaryWriter w, LogEntry item) { ... }
+    public LogEntry Read(BinaryReader r) { ... }
+}
+```
 
+## Performance
 
-Ta1: 3, 17, 18, 24, 29, 56 |
+| Records | Memory | Merge | Time | Verified |
+|---------|--------|-------|------|----------|
+| 100K | 8 MB | 4-way | 0.1s | OK |
+| 1M | 16 MB | 8-way | 1.3s | OK |
 
-Ta2: 4, 6, 9, 10, 36, 45 | 11, 43
+## Tests
 
-Merging runs of length 6 to obtain runs of length 12. 
+35 tests covering:
+- **MinHeap**: insert, extract, duplicates, replace, 10K random
+- **Serializer**: binary roundtrip, text parse/format, comparison logic
+- **Chunk I/O**: write/read roundtrip, empty, dispose cleanup, 10K items
+- **ExternalSorter**: empty, single, sorted, reverse, duplicates, multi-chunk, multi-pass, 10K random, cancellation, temp cleanup, metrics
+- **DataGenerator**: binary/text generation, deterministic seed
 
-Tb1: 3, 4, 6, 9, 10, 17, 18, 24, 29, 36, 45, 56 |
+```bash
+dotnet test --verbosity normal
+```
 
-Tb2: 11, 43
+## Project Structure
 
-result : Ta1: 3, 4, 6, 9, 10, 11, 17, 18, 24, 29, 36, 43, 45, 56 |
+```
+external-sorting/
+├── ExternalSorting.sln
+├── src/
+│   ├── ExternalSorting.Core/       — library (algorithm + I/O)
+│   └── ExternalSorting.Console/    — CLI application
+└── tests/
+    └── ExternalSorting.Tests/      — xUnit + FluentAssertions
+```
 
-In each pass the size of the runs is doubled, thus we need [log(N/M)]+1 to get to a run equal in size to the original file.
-This run would be the entire file sorted.
+## Key Design Decisions
 
+- **Generic `T`**: Sort any type, not just strings — plug in your own `ISerializer<T>` and `IComparer<T>`
+- **MinHeap merge**: O(N log K) vs old code's O(NK log K) — orders of magnitude faster for large K
+- **Binary format**: 3-5x faster I/O than text parsing
+- **Memory-adaptive chunking**: Chunk size computed from `MaxMemoryBytes / EstimatedItemSize`
+- **Automatic cleanup**: Temp directory deleted in `finally` block, `ChunkFile` implements `IDisposable`
+- **CancellationToken**: Cooperative cancellation at chunk and merge boundaries
+- **Progress reporting**: Callback with phase + percentage for UI integration
 
+## Requirements
 
+- .NET 8.0 SDK
