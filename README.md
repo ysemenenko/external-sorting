@@ -1,6 +1,8 @@
-# External Sorting in C# / .NET 8
+# [External Sorting in C# / .NET 8](https://github.com/ysemenenko/external-sorting)
 
 Sort 1 GB of data with 1 MB of RAM. K-way external merge sort implementation using binary min-heap.
+
+[Source code on GitHub](https://github.com/ysemenenko/external-sorting)
 
 Handles datasets larger than available memory by splitting input into sorted chunks on disk and merging them with O(N log K) k-way merge. Generic `IExternalSorter<T>` — plug in any record type, comparer, and serializer.
 
