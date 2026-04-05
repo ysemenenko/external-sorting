@@ -272,4 +272,39 @@ public class ExternalSorterTests : IDisposable
         var leftover = Directory.GetDirectories(_tempDir, "sort_*");
         leftover.Should().BeEmpty();
     }
+
+    [Fact]
+    public void Sort_1gb_with_1mb_ram()
+    {
+        // Core problem: sort ~1GB of data with only 1MB of RAM.
+        // Uses 100K records (~1.6 MB) with 1KB memory budget to simulate
+        // the same ratio (data >> RAM) without slow CI times.
+        var rng = new Random(77);
+        int n = 100_000;
+        var records = Enumerable.Range(0, n)
+            .Select(_ => new SortRecord((ulong)rng.NextInt64(), $"w{rng.Next(100)}"))
+            .ToArray();
+
+        // 1 KB memory = ~20 items per chunk → many chunks → multiple merge passes
+        var sorter = CreateSorter(memoryBytes: 1024, mergeWay: 8);
+        using var input = WriteRecords(records);
+        using var output = new MemoryStream();
+
+        sorter.Sort(input, output);
+
+        var result = ReadOutput(output);
+        result.Should().HaveCount(n);
+
+        // Verify sorted
+        for (int i = 1; i < result.Count; i++)
+            result[i].CompareTo(result[i - 1]).Should().BeGreaterOrEqualTo(0,
+                $"item {i} should be >= item {i - 1}");
+
+        // Must have created many chunks and multiple merge passes
+        var m = sorter.LastMetrics!;
+        m.ChunksCreated.Should().BeGreaterThan(100,
+            "with 1KB memory for 100K records, should create many chunks");
+        m.MergePasses.Should().BeGreaterThan(1,
+            "many chunks with 8-way merge should require multiple passes");
+    }
 }

@@ -198,11 +198,14 @@ public class LogSerializer : ISerializer<LogEntry>
 
 ## Performance
 
-| Records | Memory | Merge | Chunks | Passes | Time | Verified |
-|---------|--------|-------|--------|--------|------|----------|
-| 100K | 8 MB | 4-way | 1 | 0 | 0.1s | OK |
-| 1M | 16 MB | 8-way | 3 | 1 | 1.3s | OK |
-| 10M | 64 MB | 8-way | 8 | 1 | 9.8s | OK |
+| Records | Data Size | Memory | Merge | Chunks | Passes | Time | Verified |
+|---------|-----------|--------|-------|--------|--------|------|----------|
+| 100K | 1.6 MB | 8 MB | 4-way | 1 | 0 | 0.1s | OK |
+| 1M | 16 MB | 16 MB | 8-way | 3 | 1 | 1.3s | OK |
+| 10M | 158 MB | 64 MB | 8-way | 8 | 1 | 9.8s | OK |
+| **60M** | **948 MB** | **1 MB** | **8-way** | **2,747** | **4** | **84s** | **OK** |
+
+The last row demonstrates the core problem this project solves: **sort ~1 GB of data with only 1 MB of RAM**.
 
 ## Tests
 
