@@ -260,3 +260,26 @@ brew install dotnet-sdk
 # Verify
 dotnet --version
 ```
+
+## References
+
+- [External sorting — Wikipedia](https://en.wikipedia.org/wiki/External_sorting)
+- [K-way merge algorithm — Wikipedia](https://en.wikipedia.org/wiki/K-way_merge_algorithm)
+- [Binary heap — Wikipedia](https://en.wikipedia.org/wiki/Binary_heap)
+- [Knuth, TAOCP Vol. 3 — Sorting and Searching, Ch. 5.4: External Sorting](https://en.wikipedia.org/wiki/The_Art_of_Computer_Programming)
+- [Sort 1GB with 1MB RAM — classic system design problem](https://en.wikipedia.org/wiki/External_sorting#External_merge_sort)
+- [.NET 8 documentation](https://learn.microsoft.com/en-us/dotnet/core/whats-new/dotnet-8)
+
+## Related Topics
+
+If you're studying this problem, you might also be interested in:
+
+- [MapReduce](https://en.wikipedia.org/wiki/MapReduce) — distributed external sorting at scale
+- [B-tree](https://en.wikipedia.org/wiki/B-tree) — disk-optimized data structure using similar I/O principles
+- [Replacement selection sort](https://en.wikipedia.org/wiki/Replacement_selection_sorting) — alternative initial run generation (produces longer runs than naive chunking)
+- [Polyphase merge sort](https://en.wikipedia.org/wiki/Polyphase_merge_sort) — optimized tape merge schedule
+- [Tournament sort](https://en.wikipedia.org/wiki/Tournament_sort) — alternative to binary heap for k-way merge
+
+## License
+
+MIT
