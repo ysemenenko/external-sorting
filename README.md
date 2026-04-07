@@ -1,5 +1,7 @@
 # [External Sorting in C# / .NET 8](https://github.com/ysemenenko/external-sorting)
 
+[![NuGet](https://img.shields.io/nuget/v/ExternalSorting.Core.svg)](https://www.nuget.org/packages/ExternalSorting.Core)
+
 Sort 1 GB of data with 1 MB of RAM. K-way external merge sort implementation using binary min-heap.
 
 [Source code on GitHub](https://github.com/ysemenenko/external-sorting)
@@ -123,6 +125,12 @@ Time: 9.8s (6.1s chunking + 3.3s merging)
 | Total bytes read/written | O(N × (P + 1)) | ~316 MB × 2 |
 
 **Key insight**: Increasing K reduces passes (fewer disk I/O rounds) but increases heap operations per item. K=8 to K=16 is the sweet spot for most workloads — one merge pass handles up to K^1 = 8-16 chunks, and two passes handle up to K^2 = 64-256 chunks (billions of records).
+
+## Installation
+
+```bash
+dotnet add package ExternalSorting.Core
+```
 
 ## Quick Start
 
