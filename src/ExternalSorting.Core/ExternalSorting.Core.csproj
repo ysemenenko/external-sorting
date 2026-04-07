@@ -4,5 +4,21 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>12</LangVersion>
+
+    <!-- NuGet package metadata -->
+    <PackageId>ExternalSorting.Core</PackageId>
+    <Version>1.0.1</Version>
+    <Authors>Yaroslav Semenenko</Authors>
+    <Description>K-way external merge sort for .NET 8. Sort datasets larger than available memory using binary min-heap merge. Generic IExternalSorter&lt;T&gt; — plug in any record type, comparer, and serializer.</Description>
+    <PackageTags>external-sort;merge-sort;k-way-merge;large-file;disk-sort;out-of-core;sorting</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/ysemenenko/external-sorting</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/ysemenenko/external-sorting.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
 </Project>
