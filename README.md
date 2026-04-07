@@ -129,7 +129,7 @@ Time: 9.8s (6.1s chunking + 3.3s merging)
 ## Installation
 
 ```bash
-dotnet add package ExternalSorting.Core --version 1.0.1
+dotnet add package ExternalSorting.Core --version 1.0.2
 ```
 
 ## Quick Start
