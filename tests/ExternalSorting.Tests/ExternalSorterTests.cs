@@ -438,6 +438,211 @@ public class ExternalSorterTests : IDisposable
         act.Should().Throw<OperationCanceledException>();
     }
 
+    // ── Parallel chunk creation correctness ─────────────────────────────
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(4)]
+    [InlineData(8)]
+    public void Sort_parallel_matches_serial_on_random_input(int parallelism)
+    {
+        // Same dataset, same merge options — only DegreeOfParallelism
+        // varies. Output bytes must be identical to the serial baseline,
+        // proving the parallel pipeline doesn't reorder, drop, duplicate,
+        // or mangle anything.
+        var rng = new Random(31337);
+        int n = 2000;
+        var records = Enumerable.Range(0, n)
+            .Select(_ => new SortRecord(
+                (ulong)rng.NextInt64(),
+                $"k{rng.Next(200)}_{rng.Next(200)}"))
+            .ToArray();
+
+        byte[] Run(int p)
+        {
+            var sorter = new ExternalSorter<SortRecord>(
+                _serializer, Comparer<SortRecord>.Default, new SortOptions
+                {
+                    MaxMemoryBytes = 48 * 20,  // ~20 items per chunk
+                    MergeWayCount = 4,
+                    TempDirectory = _tempDir,
+                    DegreeOfParallelism = p,
+                });
+            using var input = WriteRecords(records);
+            using var output = new MemoryStream();
+            sorter.Sort(input, output);
+            return output.ToArray();
+        }
+
+        byte[] baseline = Run(1);
+        byte[] underTest = Run(parallelism);
+
+        underTest.Should().Equal(baseline,
+            $"DegreeOfParallelism={parallelism} must produce byte-identical " +
+            $"output to the serial baseline");
+    }
+
+    [Fact]
+    public void Sort_parallel_stress_repeated_runs_are_deterministic()
+    {
+        // Run the same parallel sort 25 times. Any race condition that
+        // would corrupt output (lost item, double-write, wrong chunk
+        // index assignment) tends to surface non-deterministically;
+        // doing many repeats catches it. Output bytes must match across
+        // every iteration.
+        var rng = new Random(7);
+        int n = 1500;
+        var records = Enumerable.Range(0, n)
+            .Select(_ => new SortRecord((ulong)rng.NextInt64(), $"r{rng.Next(50)}"))
+            .ToArray();
+
+        byte[]? expected = null;
+        for (int i = 0; i < 25; i++)
+        {
+            var sorter = new ExternalSorter<SortRecord>(
+                _serializer, Comparer<SortRecord>.Default, new SortOptions
+                {
+                    MaxMemoryBytes = 48 * 15,
+                    MergeWayCount = 4,
+                    TempDirectory = _tempDir,
+                    DegreeOfParallelism = 8,  // max contention
+                });
+            using var input = WriteRecords(records);
+            using var output = new MemoryStream();
+            sorter.Sort(input, output);
+
+            byte[] bytes = output.ToArray();
+            if (expected is null)
+            {
+                expected = bytes;
+                continue;
+            }
+            bytes.Should().Equal(expected,
+                $"iteration {i}: parallel sort must be deterministic");
+        }
+    }
+
+    [Fact]
+    public void Sort_parallel_chunk_count_matches_serial()
+    {
+        // ChunksCreated metric should be the same regardless of
+        // parallelism — same input, same chunk capacity, same number
+        // of full buffers. Catches off-by-one errors in chunk index
+        // assignment under concurrent worker reads.
+        var rng = new Random(101);
+        var records = Enumerable.Range(0, 500)
+            .Select(_ => new SortRecord((ulong)rng.NextInt64(), $"x{rng.Next(20)}"))
+            .ToArray();
+
+        int CountChunks(int p)
+        {
+            var sorter = new ExternalSorter<SortRecord>(
+                _serializer, Comparer<SortRecord>.Default, new SortOptions
+                {
+                    MaxMemoryBytes = 48 * 25,
+                    MergeWayCount = 4,
+                    TempDirectory = _tempDir,
+                    DegreeOfParallelism = p,
+                });
+            using var input = WriteRecords(records);
+            using var output = new MemoryStream();
+            sorter.Sort(input, output);
+            return sorter.LastMetrics!.ChunksCreated;
+        }
+
+        int serialChunks = CountChunks(1);
+        CountChunks(2).Should().Be(serialChunks);
+        CountChunks(4).Should().Be(serialChunks);
+        CountChunks(8).Should().Be(serialChunks);
+    }
+
+    [Fact]
+    public void Sort_parallel_cancellation_unblocks_pipeline()
+    {
+        // Pre-cancelled token: the parallel pipeline must tear down
+        // without deadlocking the bounded queue. Reader detects CT,
+        // CompleteAdding fires from the finally block, workers see
+        // queue done and exit, WaitAll returns or surfaces OCE.
+        var rng = new Random(42);
+        var records = Enumerable.Range(0, 5000)
+            .Select(_ => new SortRecord((ulong)rng.NextInt64(), "t"))
+            .ToArray();
+
+        var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var sorter = new ExternalSorter<SortRecord>(
+            _serializer, Comparer<SortRecord>.Default, new SortOptions
+            {
+                MaxMemoryBytes = 48,  // tiny → many small chunks → max queue churn
+                MergeWayCount = 8,
+                TempDirectory = _tempDir,
+                DegreeOfParallelism = 8,
+            });
+        using var input = WriteRecords(records);
+        using var output = new MemoryStream();
+
+        // Should throw OperationCanceledException, not hang
+        var act = () => sorter.Sort(input, output, cts.Token);
+        act.Should().Throw<OperationCanceledException>();
+    }
+
+    [Fact]
+    public void Sort_replacement_selection_overrides_parallelism()
+    {
+        // RS is mutually exclusive with parallel chunk creation
+        // (single shared heap). When both options are set, RS wins
+        // and the resulting chunk file names start with "chunk_rs_"
+        // (the RS code path's prefix). The simple path uses
+        // "chunk_". This is an indirect way to assert RS was chosen
+        // — we read the metrics ChunksCreated from the RS path which
+        // also produces fewer chunks for random input.
+        var rng = new Random(1234);
+        var records = Enumerable.Range(0, 1000)
+            .Select(_ => new SortRecord((ulong)rng.NextInt64(0, 100_000), $"k{rng.Next(50)}"))
+            .ToArray();
+
+        const long memBytes = 48 * 30;
+
+        // Both options set — RS should take priority
+        var rsAndParallel = new ExternalSorter<SortRecord>(
+            _serializer, Comparer<SortRecord>.Default, new SortOptions
+            {
+                MaxMemoryBytes = memBytes,
+                MergeWayCount = 4,
+                TempDirectory = _tempDir,
+                UseReplacementSelection = true,
+                DegreeOfParallelism = 8,
+            });
+        using (var input = WriteRecords(records))
+        using (var output = new MemoryStream())
+        {
+            rsAndParallel.Sort(input, output);
+        }
+
+        // Pure parallel for comparison
+        var parallelOnly = new ExternalSorter<SortRecord>(
+            _serializer, Comparer<SortRecord>.Default, new SortOptions
+            {
+                MaxMemoryBytes = memBytes,
+                MergeWayCount = 4,
+                TempDirectory = _tempDir,
+                UseReplacementSelection = false,
+                DegreeOfParallelism = 8,
+            });
+        using (var input = WriteRecords(records))
+        using (var output = new MemoryStream())
+        {
+            parallelOnly.Sort(input, output);
+        }
+
+        // RS produces noticeably fewer chunks on random input
+        rsAndParallel.LastMetrics!.ChunksCreated
+            .Should().BeLessThan((int)(parallelOnly.LastMetrics!.ChunksCreated * 0.8),
+                "RS path should be chosen over parallel even when both options are set");
+    }
+
     [Fact]
     public void Sort_1gb_with_1mb_ram()
     {
