@@ -273,6 +273,171 @@ public class ExternalSorterTests : IDisposable
         leftover.Should().BeEmpty();
     }
 
+    // ── Replacement Selection ───────────────────────────────────────────
+
+    private ExternalSorter<SortRecord> CreateSorterRS(long memoryBytes = 4096, int mergeWay = 8)
+    {
+        return new ExternalSorter<SortRecord>(_serializer, Comparer<SortRecord>.Default, new SortOptions
+        {
+            MaxMemoryBytes = memoryBytes,
+            MergeWayCount = mergeWay,
+            TempDirectory = _tempDir,
+            UseReplacementSelection = true,
+            DegreeOfParallelism = 1,  // RS ignores parallelism anyway
+        });
+    }
+
+    [Fact]
+    public void Sort_RS_empty_input()
+    {
+        var sorter = CreateSorterRS();
+        using var input = new MemoryStream();
+        using var output = new MemoryStream();
+
+        sorter.Sort(input, output);
+
+        output.Length.Should().Be(0);
+        sorter.LastMetrics!.ChunksCreated.Should().Be(0);
+    }
+
+    [Fact]
+    public void Sort_RS_single_item()
+    {
+        var sorter = CreateSorterRS();
+        using var input = WriteRecords(new SortRecord(7, "Apple"));
+        using var output = new MemoryStream();
+
+        sorter.Sort(input, output);
+
+        var result = ReadOutput(output);
+        result.Should().Equal(new SortRecord(7, "Apple"));
+        sorter.LastMetrics!.ChunksCreated.Should().Be(1);
+    }
+
+    [Fact]
+    public void Sort_RS_already_sorted_collapses_to_single_run()
+    {
+        // Best case for RS: ascending input → entire stream becomes one run
+        // because every new item is ≥ the just-emitted one.
+        var records = Enumerable.Range(0, 200)
+            .Select(i => new SortRecord((ulong)i, $"item_{i:D4}"))
+            .ToArray();
+
+        // Heap of ~10 items would normally produce ~20 chunks of 10 each.
+        // RS with ascending input should produce exactly 1 chunk.
+        var sorter = CreateSorterRS(memoryBytes: 48 * 10, mergeWay: 4);
+        using var input = WriteRecords(records);
+        using var output = new MemoryStream();
+
+        sorter.Sort(input, output);
+
+        var result = ReadOutput(output);
+        result.Should().Equal(records);
+        sorter.LastMetrics!.ChunksCreated.Should().Be(1,
+            "ascending input → RS produces a single run");
+    }
+
+    [Fact]
+    public void Sort_RS_reverse_order_degenerates_to_M_sized_runs()
+    {
+        // Worst case for RS: descending input → every new item goes to
+        // the next run, so chunks are exactly heap-sized (no improvement
+        // over simple chunking, but no regression either).
+        var records = Enumerable.Range(0, 30)
+            .Select(i => new SortRecord((ulong)(100 - i), $"x{100 - i:D3}"))
+            .ToArray();
+
+        var sorter = CreateSorterRS(memoryBytes: 48 * 5);  // ~5 items per chunk
+        using var input = WriteRecords(records);
+        using var output = new MemoryStream();
+
+        sorter.Sort(input, output);
+
+        var result = ReadOutput(output);
+        result.Should().HaveCount(30);
+        result.Should().BeInAscendingOrder(r => r);
+    }
+
+    [Fact]
+    public void Sort_RS_random_input_produces_fewer_chunks_than_simple()
+    {
+        // The headline win: random input → ~2x larger runs → ~half as
+        // many chunks vs the simple fixed-size chunking path.
+        var rng = new Random(2024);
+        int n = 1000;
+        var records = Enumerable.Range(0, n)
+            .Select(_ => new SortRecord((ulong)rng.NextInt64(0, 1_000_000), $"k{rng.Next(100)}"))
+            .ToArray();
+
+        // Identical sort options except for the algorithm switch
+        const long memBytes = 48 * 50;  // ~50 items per chunk
+
+        var simple = CreateSorter(memoryBytes: memBytes);
+        using (var input = WriteRecords(records))
+        using (var output = new MemoryStream())
+        {
+            simple.Sort(input, output);
+        }
+
+        var rs = CreateSorterRS(memoryBytes: memBytes);
+        using (var input = WriteRecords(records))
+        using (var output = new MemoryStream())
+        {
+            rs.Sort(input, output);
+        }
+
+        int simpleChunks = simple.LastMetrics!.ChunksCreated;
+        int rsChunks = rs.LastMetrics!.ChunksCreated;
+
+        // For random input on a heap of size M, average run is ~2M.
+        // Allow some slack — Knuth's 2x is a probabilistic average,
+        // not a worst-case bound. Anything below 80% of the simple
+        // chunk count is a clear win.
+        rsChunks.Should().BeLessThan((int)(simpleChunks * 0.8),
+            $"RS should produce noticeably fewer chunks than simple chunking " +
+            $"(simple={simpleChunks}, rs={rsChunks})");
+    }
+
+    [Fact]
+    public void Sort_RS_correctness_random_dataset()
+    {
+        var rng = new Random(13);
+        int n = 5000;
+        var records = Enumerable.Range(0, n)
+            .Select(_ => new SortRecord((ulong)rng.NextInt64(), $"w{rng.Next(50)}"))
+            .ToArray();
+
+        var sorter = CreateSorterRS(memoryBytes: 48 * 30, mergeWay: 4);
+        using var input = WriteRecords(records);
+        using var output = new MemoryStream();
+
+        sorter.Sort(input, output);
+
+        var result = ReadOutput(output);
+        result.Should().HaveCount(n);
+        for (int i = 1; i < result.Count; i++)
+            result[i].CompareTo(result[i - 1]).Should().BeGreaterOrEqualTo(0);
+    }
+
+    [Fact]
+    public void Sort_RS_cancellation_throws()
+    {
+        var rng = new Random(42);
+        var records = Enumerable.Range(0, 1000)
+            .Select(_ => new SortRecord((ulong)rng.NextInt64(), "test"))
+            .ToArray();
+
+        var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        var sorter = CreateSorterRS(memoryBytes: 48);
+        using var input = WriteRecords(records);
+        using var output = new MemoryStream();
+
+        var act = () => sorter.Sort(input, output, cts.Token);
+        act.Should().Throw<OperationCanceledException>();
+    }
+
     [Fact]
     public void Sort_1gb_with_1mb_ram()
     {

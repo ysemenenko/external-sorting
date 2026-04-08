@@ -17,6 +17,20 @@ public sealed class SortOptions
     /// <summary>Degree of parallelism for chunk sorting. Default: processor count.</summary>
     public int DegreeOfParallelism { get; init; } = Environment.ProcessorCount;
 
+    /// <summary>
+    /// Use Replacement Selection during chunk creation. When true, the
+    /// chunk phase runs Knuth's algorithm which produces runs that are
+    /// on average twice the size of MaxMemoryBytes for random input.
+    /// Fewer chunks → fewer merge passes → less total disk I/O. Trades
+    /// CPU (more heap operations) for I/O. Default: false (simple
+    /// fixed-size chunking).
+    ///
+    /// Mutually exclusive with parallelism: when true, DegreeOfParallelism
+    /// is ignored because Replacement Selection is inherently single-
+    /// threaded (the heap is shared across the entire input stream).
+    /// </summary>
+    public bool UseReplacementSelection { get; init; } = false;
+
     /// <summary>Progress callback: (phase, percentComplete).</summary>
     public Action<SortPhase, double>? OnProgress { get; init; }
 }
