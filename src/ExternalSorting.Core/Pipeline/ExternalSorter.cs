@@ -182,14 +182,23 @@ public sealed class ExternalSorter<T> : IExternalSorter<T>
         // Placeholder for count header
         bw.Write(0);
 
+        // K-way merge with ReplaceMin fast-path: when the reader that
+        // just yielded the min still has more data, we can overwrite
+        // the heap root in place (one SiftDown) instead of doing
+        // ExtractMin + Insert (SiftDown + SiftUp). This saves the
+        // SiftUp half of the work for every item except the last one
+        // from each input — i.e. ~50% of the heap ops at the bottom
+        // of the merge phase, where this loop is the hot path.
         while (heap.Count > 0)
         {
-            var (item, readerIdx) = heap.ExtractMin();
+            var (item, readerIdx) = heap.Peek();
             _serializer.Write(bw, item);
             totalItems++;
 
             if (readers[readerIdx].MoveNext())
-                heap.Insert((readers[readerIdx].Current, readerIdx));
+                heap.ReplaceMin((readers[readerIdx].Current, readerIdx));
+            else
+                heap.ExtractMin();
         }
 
         // Patch header with actual count
