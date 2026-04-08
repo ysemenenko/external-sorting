@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using ExternalSorting.Core.IO;
 using ExternalSorting.Core.Merge;
@@ -60,6 +61,18 @@ public sealed class ExternalSorter<T> : IExternalSorter<T>
 
     private List<ChunkFile> CreateChunks(Stream input, string tempDir, SortMetrics metrics, CancellationToken ct)
     {
+        // Dispatch: serial path reuses one buffer (lowest GC), parallel
+        // path runs a single reader thread feeding N sorter/writer
+        // workers via a bounded BlockingCollection. P=1 falls through
+        // to the original serial implementation byte-for-byte.
+        int parallelism = Math.Max(1, _options.DegreeOfParallelism);
+        if (parallelism == 1)
+            return CreateChunksSerial(input, tempDir, metrics, ct);
+        return CreateChunksParallel(input, tempDir, metrics, ct, parallelism);
+    }
+
+    private List<ChunkFile> CreateChunksSerial(Stream input, string tempDir, SortMetrics metrics, CancellationToken ct)
+    {
         var chunks = new List<ChunkFile>();
         int chunkCapacity = Math.Max(1, (int)(_options.MaxMemoryBytes / _serializer.EstimatedItemSize));
         var buffer = new List<T>(chunkCapacity);
@@ -92,7 +105,7 @@ public sealed class ExternalSorter<T> : IExternalSorter<T>
             buffer.Sort(_comparer);
 
             // Write chunk to disk
-            var chunk = ChunkWriter.Write(buffer, _serializer, tempDir, chunkIndex);
+            var chunk = ChunkWriter.Write(buffer, _serializer, tempDir, chunkIndex, _options.BufferSize);
             chunks.Add(chunk);
 
             metrics.TotalItems += buffer.Count;
@@ -103,6 +116,113 @@ public sealed class ExternalSorter<T> : IExternalSorter<T>
         }
 
         return chunks;
+    }
+
+    private List<ChunkFile> CreateChunksParallel(
+        Stream input, string tempDir, SortMetrics metrics,
+        CancellationToken ct, int parallelism)
+    {
+        // Pipelined chunk creation: one reader thread streams items off
+        // *input* and hands fully-filled buffers to a worker pool that
+        // sorts each buffer and writes the chunk to disk in parallel.
+        // The bounded BlockingCollection caps in-flight buffers at
+        // parallelism*2 so we don't run away from MaxMemoryBytes by
+        // an unbounded amount under producer-faster-than-consumers.
+        //
+        // Memory note: peak RAM during this phase is approximately
+        // (parallelism+1) * (MaxMemoryBytes / EstimatedItemSize) items
+        // — one buffer being filled by the reader, and up to parallelism
+        // more being processed by workers. Document this in SortOptions
+        // if you need to dial it back further.
+        int chunkCapacity = Math.Max(1, (int)(_options.MaxMemoryBytes / _serializer.EstimatedItemSize));
+
+        // Linked CTS so a worker can fault the pipeline and unblock the
+        // reader (otherwise a worker dying with disk-full would leave
+        // the reader blocked on queue.Add forever).
+        using var workerCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var combinedCt = workerCts.Token;
+
+        using var queue = new BlockingCollection<(int Index, List<T> Buffer)>(
+            boundedCapacity: parallelism * 2);
+        var resultBag = new ConcurrentBag<ChunkFile>();
+
+        var workers = new Task[parallelism];
+        for (int w = 0; w < parallelism; w++)
+        {
+            workers[w] = Task.Run(() =>
+            {
+                try
+                {
+                    foreach (var (idx, buf) in queue.GetConsumingEnumerable(combinedCt))
+                    {
+                        buf.Sort(_comparer);
+                        var chunk = ChunkWriter.Write(
+                            buf, _serializer, tempDir, idx, _options.BufferSize);
+                        resultBag.Add(chunk);
+                    }
+                }
+                catch
+                {
+                    // Cancel siblings + reader so the pipeline tears
+                    // down cleanly instead of deadlocking on queue.Add.
+                    workerCts.Cancel();
+                    throw;
+                }
+            });
+        }
+
+        var reader = new BinaryReader(input);
+        int chunkIndex = 0;
+        try
+        {
+            while (true)
+            {
+                combinedCt.ThrowIfCancellationRequested();
+                // Allocate a fresh buffer per chunk — workers process
+                // them concurrently so we cannot reuse the serial path's
+                // single recycled buffer.
+                var buffer = new List<T>(chunkCapacity);
+                for (int i = 0; i < chunkCapacity; i++)
+                {
+                    try
+                    {
+                        buffer.Add(_serializer.Read(reader));
+                    }
+                    catch (EndOfStreamException)
+                    {
+                        break;
+                    }
+                }
+                if (buffer.Count == 0)
+                    break;
+
+                int count = buffer.Count;
+                queue.Add((chunkIndex++, buffer), combinedCt);
+                metrics.TotalItems += count;
+                metrics.ChunksCreated++;
+                _options.OnProgress?.Invoke(SortPhase.ChunkCreation, -1);
+            }
+        }
+        finally
+        {
+            queue.CompleteAdding();
+        }
+
+        try
+        {
+            Task.WaitAll(workers);
+        }
+        catch (AggregateException ae)
+        {
+            // Surface the first inner exception so the caller still
+            // sees OperationCanceledException / IOException etc., not
+            // a generic AggregateException wrapper.
+            if (ae.InnerExceptions.Count == 1)
+                throw ae.InnerExceptions[0];
+            throw;
+        }
+
+        return resultBag.ToList();
     }
 
     private void MergeChunks(List<ChunkFile> chunks, Stream output, string tempDir,
