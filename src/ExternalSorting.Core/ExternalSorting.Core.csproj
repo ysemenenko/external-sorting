@@ -7,9 +7,9 @@
 
     <!-- NuGet package metadata -->
     <PackageId>ExternalSorting.Core</PackageId>
-    <Version>1.0.2</Version>
+    <Version>1.0.3</Version>
     <Authors>Yaroslav Semenenko</Authors>
-    <Description>K-way external merge sort for .NET 8. Sort datasets larger than available memory using binary min-heap merge. Generic IExternalSorter&lt;T&gt; — plug in any record type, comparer, and serializer.</Description>
+    <Description>K-way external merge sort for .NET 8. Sort datasets larger than available memory using binary min-heap merge. v1.0.3 adds pipelined parallel chunk creation, Knuth's Replacement Selection (~2x larger runs), and a ReplaceMin merge fast path (30-34% faster). Generic IExternalSorter&lt;T&gt; — plug in any record type, comparer, and serializer.</Description>
     <PackageTags>external-sort;merge-sort;k-way-merge;large-file;disk-sort;out-of-core;sorting</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://ysemenenko.github.io/external-sorting/</PackageProjectUrl>

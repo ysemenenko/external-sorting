@@ -17,12 +17,15 @@ ExternalSorting.Core/
 ├── Core/
 │   ├── IExternalSorter<T>    — main contract: Stream → sorted Stream
 │   ├── ISerializer<T>        — binary serialization for any record type
-│   ├── SortOptions            — memory budget, merge factor, parallelism, temp dir
+│   ├── SortOptions            — memory, merge, parallelism, replacement-selection
 │   └── SortMetrics            — items, chunks, merge passes, timing
 ├── Pipeline/
-│   └── ExternalSorter<T>     — orchestrator: chunk phase → merge phase
+│   └── ExternalSorter<T>     — orchestrator with three chunk strategies:
+│                                  • serial (1 thread, 1 recycled buffer)
+│                                  • parallel (N workers, bounded queue)
+│                                  • replacement selection (~2x larger runs)
 ├── Merge/
-│   └── MinHeap<T>            — O(log K) binary min-heap for k-way merge
+│   └── MinHeap<T>            — O(log K) binary min-heap with ReplaceMin
 └── IO/
     ├── ChunkWriter/Reader     — buffered binary chunk I/O with headers
     ├── RecordSerializer       — SortRecord (ulong + string) binary format
@@ -79,6 +82,45 @@ Chunk C:  [4, 6, 7, ...]     ──┼──→  MinHeap (size K=3)  ──→  
 
 **Why MinHeap?** The old implementation used `List.Sort()` on every extraction — O(K log K) per item, O(NK log K) total. MinHeap gives O(N log K), which is orders of magnitude faster for large K (8-way, 16-way merge).
 
+**ReplaceMin fast path.** When the source that just yielded the min still has more data, the merge loop overwrites the heap root in place via `MinHeap.ReplaceMin` (one SiftDown) instead of doing `ExtractMin + Insert` (SiftDown + SiftUp). Measured **30% speedup at K=8 and 34% at K=16** on the merge inner loop — see [Benchmarks](#benchmarks).
+
+#### Phase 1 alternatives — Replacement Selection
+
+The simple chunking above produces runs that are exactly *M* items long. **Knuth's Replacement Selection** (TAOCP Vol. 3, §5.4.1) does better: by keeping the heap "live" across the entire input stream and routing items to a "next run" when they would break sorted order, it produces runs that average **2 × M** for random input.
+
+```
+heap = M items from input, all tagged "run 0"
+current_run = 0
+while heap not empty:
+    (run, item) = heap.extractMin()
+    if run != current_run:
+        close current chunk file, open a new one for the new run
+        current_run = run
+    write item to current chunk
+    next = read one item from input
+    if next >= just-emitted item:
+        heap.insert((current_run, next))      # extends current run
+    else:
+        heap.insert((current_run + 1, next))  # frozen for next run
+```
+
+Result on a 50K random dataset with 32 KB heap: **74 chunks → 38 chunks** (49% fewer), **3 merge passes → 2** (one fewer disk pass), **32% less memory allocated**. Best case (already-sorted input) collapses the entire stream into a single run; worst case (reverse-sorted) degenerates to *M*-sized runs with no improvement and no regression.
+
+Opt in via `SortOptions.UseReplacementSelection = true`. Inherently single-threaded so it ignores `DegreeOfParallelism`.
+
+#### Phase 1 alternatives — Pipelined parallel chunking
+
+When `SortOptions.DegreeOfParallelism > 1`, chunk creation runs as a producer/consumer pipeline:
+
+```
+Reader (1 thread) ──► [bounded queue, capacity = parallelism × 2] ──► Workers (N threads)
+       │                                                                    │
+   read input into                                                      buffer.Sort() +
+   per-chunk buffer                                                     ChunkWriter.Write
+```
+
+The bounded `BlockingCollection` caps in-flight buffers so memory growth is bounded by `~(parallelism + 1) × MaxMemoryBytes`. A linked `CancellationTokenSource` propagates worker faults back to the reader so a disk-full error tears the pipeline down cleanly instead of deadlocking. Measured **1.12× speedup** at the sweet spot (P=4 on a 4-physical-core box) for in-memory workloads — wider for disk-bound ones because writes overlap with sorting.
+
 #### Concrete Example
 
 Sort 10M records with 64 MB memory, 8-way merge:
@@ -129,7 +171,7 @@ Time: 9.8s (6.1s chunking + 3.3s merging)
 ## Installation
 
 ```bash
-dotnet add package ExternalSorting.Core --version 1.0.2
+dotnet add package ExternalSorting.Core --version 1.0.3
 ```
 
 ## Quick Start
@@ -138,7 +180,7 @@ dotnet add package ExternalSorting.Core --version 1.0.2
 # Build
 dotnet build
 
-# Run tests (35 tests)
+# Run tests (51 tests)
 dotnet test
 
 # Sort 100K records (quick check)
@@ -183,6 +225,17 @@ var options = new SortOptions
 {
     MaxMemoryBytes = 64 * 1024 * 1024,  // 64 MB
     MergeWayCount = 8,
+    BufferSize = 64 * 1024,             // FileStream buffer
+
+    // Phase 3.1 — pipelined parallel chunk creation. One reader thread
+    // feeds N sort+write workers via a bounded queue. Default = ProcessorCount.
+    DegreeOfParallelism = Environment.ProcessorCount,
+
+    // Phase 3.2 — Replacement Selection. Produces ~2x larger runs on
+    // random input → fewer chunks → fewer merge passes. Mutually
+    // exclusive with parallel chunking (single-heap algorithm).
+    UseReplacementSelection = false,
+
     OnProgress = (phase, pct) => Console.Write($"\r{phase} {pct:F0}%"),
 };
 
@@ -194,6 +247,16 @@ sorter.Sort(input, output);
 
 Console.WriteLine(sorter.LastMetrics); // Items: 1,000,000, Chunks: 3, ...
 ```
+
+#### Picking a chunk strategy
+
+| Workload | Recommended | Why |
+|---|---|---|
+| Default / unknown | parallel (default) | linear-ish speedup with cores, no algorithm risk |
+| Memory-constrained, random input | `UseReplacementSelection = true` | ~50% fewer chunks → one fewer merge pass → less disk I/O |
+| Mostly-sorted input | `UseReplacementSelection = true` | best case collapses entire stream into a single run |
+| Reverse-sorted input | parallel | RS degenerates to *M*-sized runs, parallel still wins |
+| Single-core or strict memory cap | `DegreeOfParallelism = 1` | original serial path, single recycled buffer, lowest GC |
 
 ### Custom record types
 
@@ -223,16 +286,95 @@ The last row demonstrates the core interview problem: **sort 1 GB of data with o
 
 ## Tests
 
-35 tests covering:
+51 tests covering:
 - **MinHeap**: insert, extract, duplicates, replace, 10K random
 - **Serializer**: binary roundtrip, text parse/format, comparison logic
 - **Chunk I/O**: write/read roundtrip, empty, dispose cleanup, 10K items
-- **ExternalSorter**: empty, single, sorted, reverse, duplicates, multi-chunk, multi-pass, 10K random, cancellation, temp cleanup, metrics
+- **ExternalSorter**:
+  - basics: empty, single, sorted, reverse, duplicates, multi-chunk,
+    multi-pass, 10K random, cancellation, temp cleanup, metrics
+  - **Replacement Selection**: empty, single, ascending → 1 chunk
+    (best case), descending → *M*-sized runs (worst case), random
+    input produces noticeably fewer chunks than simple chunking,
+    correctness on 5K random, cancellation
+  - **Parallel chunk creation**: byte-identical output across
+    `DegreeOfParallelism` ∈ {1,2,4,8} (Theory), 25-iteration
+    determinism stress (max contention), chunk count invariant
+    across parallelism, pre-cancelled CT unblocks pipeline cleanly,
+    RS overrides parallelism when both options are set
 - **DataGenerator**: binary/text generation, deterministic seed
 
 ```bash
-dotnet test --verbosity normal
+dotnet test
 ```
+
+## Benchmarks
+
+A separate `tests/ExternalSorting.Benchmarks/` project measures the
+perf-relevant inner loops with [BenchmarkDotNet](https://benchmarkdotnet.org/).
+
+```bash
+# Run all benchmark suites (~1-2 min total, ShortRun config)
+dotnet run -c Release --project tests/ExternalSorting.Benchmarks -- --filter '*'
+
+# Or pick one
+dotnet run -c Release --project tests/ExternalSorting.Benchmarks -- --filter '*MergeBenchmarks*'
+```
+
+Three suites:
+
+### MergeBenchmarks — `MinHeap.ReplaceMin` vs `ExtractMin + Insert`
+
+Isolates the merge inner loop from disk I/O. K pre-sorted in-memory
+sources, two methods running the same merge with different heap
+operation patterns.
+
+Intel Core i3-10100T, 4 physical cores, .NET 8.0.25:
+
+| Method | K | Mean | Ratio |
+|---|---|---|---|
+| Merge_ExtractMin_Insert | 8 | 46.92 ms | 1.00 |
+| **Merge_ReplaceMin** | **8** | **32.88 ms** | **0.70** |
+| Merge_ExtractMin_Insert | 16 | 66.13 ms | 1.00 |
+| **Merge_ReplaceMin** | **16** | **43.41 ms** | **0.66** |
+
+`ReplaceMin` is **30–34% faster** on the inner merge loop. The win
+scales slightly with K because deeper heaps = bigger SiftUp savings.
+
+### ChunkStrategyBenchmarks — Replacement Selection vs simple chunking
+
+Same dataset (50K random records, 32 KB heap), only the chunk
+algorithm differs.
+
+| Method | Mean | Allocated | Chunks | Merge passes |
+|---|---|---|---|---|
+| Sort_Simple_Chunking | 63.31 ms | 22.96 MB | 74 | 3 |
+| **Sort_Replacement_Selection** | 63.82 ms | **15.63 MB** | **38** | **2** |
+
+RS halves the chunk count and saves a full merge pass on disk.
+Wall-clock time looks identical because the heap operations during
+chunking are more expensive than `Array.Sort` (compensating for the
+merge phase saving on this in-memory benchmark) — but **memory
+allocation drops 32%** and on real disk-bound workloads the one
+fewer merge pass dominates.
+
+### SortBenchmarks — `DegreeOfParallelism` sweep
+
+End-to-end sort of a 50K-record in-memory dataset with tiny per-chunk
+memory (chunk phase dominant) so the parallelism comparison is meaningful.
+
+| Parallelism | Mean | Speedup |
+|---|---|---|
+| 1 (serial) | 61.6 ms | 1.00× |
+| 2 | 57.3 ms | 1.08× |
+| 4 ⭐ | **55.0 ms** | **1.12×** |
+| 8 | 56.7 ms | 1.09× |
+
+P=4 is the sweet spot because the test box has 4 physical cores;
+hyperthreading (P=8) adds context-switch overhead that cancels the
+marginal SMT win for this CPU+memory-bound workload. On real disk
+I/O the gap widens because parallel writes overlap with subsequent
+buffer sorting.
 
 ## Project Structure
 
@@ -240,20 +382,23 @@ dotnet test --verbosity normal
 external-sorting/
 ├── ExternalSorting.sln
 ├── src/
-│   ├── ExternalSorting.Core/       — library (algorithm + I/O)
-│   └── ExternalSorting.Console/    — CLI application
+│   ├── ExternalSorting.Core/         — library (algorithm + I/O)
+│   └── ExternalSorting.Console/      — CLI application
 └── tests/
-    └── ExternalSorting.Tests/      — xUnit + FluentAssertions
+    ├── ExternalSorting.Tests/        — xUnit + FluentAssertions (51 tests)
+    └── ExternalSorting.Benchmarks/   — BenchmarkDotNet perf suites
 ```
 
 ## Key Design Decisions
 
 - **Generic `T`**: Sort any type, not just strings — plug in your own `ISerializer<T>` and `IComparer<T>`
 - **MinHeap merge**: O(N log K) vs old code's O(NK log K) — orders of magnitude faster for large K
+- **`ReplaceMin` fast path**: merge inner loop overwrites the heap root in place when the source still has data, saving the SiftUp half of an `ExtractMin + Insert` pair (30–34% measured speedup, see [Benchmarks](#benchmarks))
+- **Three chunk strategies**: serial (lowest GC), parallel pipeline (default, ~1.12× speedup), Replacement Selection (~50% fewer chunks for random input). Dispatcher picks one in `SortOptions`.
 - **Binary format**: 3-5x faster I/O than text parsing
 - **Memory-adaptive chunking**: Chunk size computed from `MaxMemoryBytes / EstimatedItemSize`
 - **Automatic cleanup**: Temp directory deleted in `finally` block, `ChunkFile` implements `IDisposable`
-- **CancellationToken**: Cooperative cancellation at chunk and merge boundaries
+- **CancellationToken**: Cooperative cancellation at chunk and merge boundaries; parallel pipeline uses a linked CTS so a worker fault unblocks the reader instead of deadlocking
 - **Progress reporting**: Callback with phase + percentage for UI integration
 
 ## Requirements
@@ -286,7 +431,7 @@ If you're studying this problem, you might also be interested in:
 
 - [MapReduce](https://en.wikipedia.org/wiki/MapReduce) — distributed external sorting at scale
 - [B-tree](https://en.wikipedia.org/wiki/B-tree) — disk-optimized data structure using similar I/O principles
-- [Replacement selection sort](https://en.wikipedia.org/wiki/Replacement_selection_sorting) — alternative initial run generation (produces longer runs than naive chunking)
+- [Replacement selection sort](https://en.wikipedia.org/wiki/Replacement_selection_sorting) — alternative initial run generation (produces longer runs than naive chunking) — **implemented here**, opt-in via `SortOptions.UseReplacementSelection`
 - [Polyphase merge sort](https://en.wikipedia.org/wiki/Polyphase_merge_sort) — optimized tape merge schedule
 - [Tournament sort](https://en.wikipedia.org/wiki/Tournament_sort) — alternative to binary heap for k-way merge
 
