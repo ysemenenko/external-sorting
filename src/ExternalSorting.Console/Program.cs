@@ -101,10 +101,10 @@ bool isSorted = true;
 using (var fs = File.OpenRead(outputPath))
 using (var br = new BinaryReader(fs))
 {
-    int itemCount = br.ReadInt32();
+    long itemCount = br.ReadInt64();
     SortRecord? prev = null;
 
-    for (int i = 0; i < itemCount; i++)
+    for (long i = 0; i < itemCount; i++)
     {
         var current = serializer.Read(br);
         if (prev.HasValue && current.CompareTo(prev.Value) < 0)

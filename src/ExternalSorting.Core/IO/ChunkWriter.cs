@@ -15,8 +15,9 @@ public static class ChunkWriter
         using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize);
         using var bw = new BinaryWriter(fs);
 
-        // Header: item count
-        bw.Write(items.Count);
+        // Header: item count. Written as Int64 so every chunk header (leaf
+        // and merged alike) shares one 8-byte format — see ChunkReader.
+        bw.Write((long)items.Count);
 
         for (int i = 0; i < items.Count; i++)
             serializer.Write(bw, items[i]);

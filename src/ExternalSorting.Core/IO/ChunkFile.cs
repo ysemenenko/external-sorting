@@ -4,9 +4,9 @@ namespace ExternalSorting.Core.IO;
 public sealed class ChunkFile : IDisposable
 {
     public string Path { get; }
-    public int ItemCount { get; }
+    public long ItemCount { get; }
 
-    public ChunkFile(string path, int itemCount)
+    public ChunkFile(string path, long itemCount)
     {
         Path = path;
         ItemCount = itemCount;

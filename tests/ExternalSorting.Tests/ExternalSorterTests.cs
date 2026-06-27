@@ -45,9 +45,9 @@ public class ExternalSorterTests : IDisposable
     {
         output.Position = 0;
         var br = new BinaryReader(output);
-        int count = br.ReadInt32();
-        var result = new List<SortRecord>(count);
-        for (int i = 0; i < count; i++)
+        long count = br.ReadInt64();
+        var result = new List<SortRecord>((int)count);
+        for (long i = 0; i < count; i++)
             result.Add(_serializer.Read(br));
         return result;
     }

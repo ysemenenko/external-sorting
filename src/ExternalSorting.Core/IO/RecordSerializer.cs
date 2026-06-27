@@ -10,7 +10,17 @@ public readonly record struct SortRecord(ulong Number, string Text) : IComparabl
     }
 }
 
-/// <summary>Binary serializer for SortRecord.</summary>
+/// <summary>
+/// Binary serializer for <see cref="SortRecord"/>.
+/// <para>Wire format per record: an 8-byte little-endian <see cref="ulong"/>
+/// (<see cref="SortRecord.Number"/>) followed by a length-prefixed UTF-8 string
+/// (<see cref="BinaryWriter.Write(string)"/> — a 7-bit-encoded byte length then
+/// the UTF-8 bytes). <see cref="Read"/> throws <see cref="EndOfStreamException"/>
+/// on a truncated record. The sorter's chunk-creation paths catch a trailing
+/// <see cref="EndOfStreamException"/> on the caller's input, so a partially
+/// written final record is dropped rather than throwing. (Chunk files written
+/// by the sorter stay count-header strict — they are never truncated.)</para>
+/// </summary>
 public sealed class RecordSerializer : ISerializer<SortRecord>
 {
     public int EstimatedItemSize => 8 + 40; // ulong + avg string

@@ -6,7 +6,7 @@ public sealed class ChunkReader<T> : IDisposable
     private readonly ISerializer<T> _serializer;
     private readonly FileStream _fs;
     private readonly BinaryReader _reader;
-    private int _remaining;
+    private long _remaining;
 
     public bool HasMore => _remaining > 0;
     public T Current { get; private set; } = default!;
@@ -16,7 +16,7 @@ public sealed class ChunkReader<T> : IDisposable
         _serializer = serializer;
         _fs = new FileStream(chunk.Path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize);
         _reader = new BinaryReader(_fs);
-        _remaining = _reader.ReadInt32(); // header
+        _remaining = _reader.ReadInt64(); // 8-byte count header (see ChunkWriter)
     }
 
     /// <summary>Read next item into Current. Returns false when exhausted.</summary>
