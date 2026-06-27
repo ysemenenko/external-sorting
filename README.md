@@ -53,7 +53,7 @@ Input stream (N items, unsorted)
 Chunk₀  Chunk₁  Chunk₂  ...  Chunk_{C-1}     (C = ⌈N/M⌉ chunks)
 ```
 
-Each chunk is a self-contained binary file: `[int32: count][item₀][item₁]...[item_{M-1}]`.
+Each chunk is a self-contained binary file: `[int64: count][item₀][item₁]...[item_{M-1}]`. The final output uses the same 8-byte count header.
 
 #### Phase 2 — K-Way Merge
 
@@ -174,13 +174,15 @@ Time: 9.8s (6.1s chunking + 3.3s merging)
 dotnet add package ExternalSorting.Core --version 1.0.4
 ```
 
+See [CHANGELOG.md](CHANGELOG.md) for the full release history.
+
 ## Quick Start
 
 ```bash
 # Build
 dotnet build
 
-# Run tests (51 tests)
+# Run tests (71 tests)
 dotnet test
 
 # Sort 100K records (quick check)
@@ -286,7 +288,7 @@ The last row demonstrates the core interview problem: **sort 1 GB of data with o
 
 ## Tests
 
-51 tests covering:
+71 tests covering:
 - **MinHeap**: insert, extract, duplicates, replace, 10K random
 - **Serializer**: binary roundtrip, text parse/format, comparison logic
 - **Chunk I/O**: write/read roundtrip, empty, dispose cleanup, 10K items
@@ -302,6 +304,11 @@ The last row demonstrates the core interview problem: **sort 1 GB of data with o
     determinism stress (max contention), chunk count invariant
     across parallelism, pre-cancelled CT unblocks pipeline cleanly,
     RS overrides parallelism when both options are set
+  - **Parallel merge**: deep multi-pass merge (mergeWay=2, DOP=8) is
+    byte-identical to serial and fully sorted
+  - **Robustness**: option/null validation, fault cleanup on all three
+    chunk strategies, fault path drains blocked workers (cross-platform),
+    Int64-header round-trip, truncated-input EOF, `leaveOpen`, byte metrics
 - **DataGenerator**: binary/text generation, deterministic seed
 
 ```bash
@@ -400,7 +407,7 @@ external-sorting/
 │   ├── ExternalSorting.Core/         — library (algorithm + I/O)
 │   └── ExternalSorting.Console/      — CLI application
 └── tests/
-    ├── ExternalSorting.Tests/        — xUnit + FluentAssertions (51 tests)
+    ├── ExternalSorting.Tests/        — xUnit + FluentAssertions (71 tests)
     └── ExternalSorting.Benchmarks/   — BenchmarkDotNet perf suites
 ```
 
