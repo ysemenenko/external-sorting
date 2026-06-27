@@ -658,13 +658,16 @@ public sealed class ExternalSorter<T> : IExternalSorter<T>
 
     private void WriteFinalOutput(ChunkFile chunk, Stream output)
     {
-        using var reader = new ChunkReader<T>(chunk, _serializer, _options.BufferSize);
-        using var bw = new BinaryWriter(output, System.Text.Encoding.UTF8, leaveOpen: true);
-
-        // Write header
-        bw.Write(chunk.ItemCount);
-
-        while (reader.MoveNext())
-            _serializer.Write(bw, reader.Current);
+        // The final merged chunk is already in the exact output format —
+        // [int64 count][item]... — so copy its bytes verbatim instead of
+        // deserializing then re-serializing every record. That removes a whole
+        // pass of per-record (string) allocation from the hot path and is also
+        // faster: a buffered byte copy instead of N round-trips through T.
+        // (Byte-identical to the old deserialize+reserialize because Read∘Write
+        // round-trips the format exactly.)
+        using var fs = new FileStream(chunk.Path, FileMode.Open, FileAccess.Read,
+                                      FileShare.Read, _options.BufferSize);
+        fs.CopyTo(output, _options.BufferSize);
+        output.Flush();
     }
 }

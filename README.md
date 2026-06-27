@@ -171,7 +171,7 @@ Time: 9.8s (6.1s chunking + 3.3s merging)
 ## Installation
 
 ```bash
-dotnet add package ExternalSorting.Core --version 1.0.4
+dotnet add package ExternalSorting.Core --version 1.0.5
 ```
 
 See [CHANGELOG.md](CHANGELOG.md) for the full release history.
@@ -393,10 +393,13 @@ Merging the independent per-pass batches concurrently lifted that to
 **~1.54×** and moved the sweet spot from P=4 to the P=4–8 plateau —
 roughly **−24% wall-clock at P=8**. The remaining serial tail is the last
 single-batch pass plus the final output write; P=16 dips slightly because
-the 16 SMT threads are oversubscribed. Allocation stays ~23.75 MB across the
+the 16 SMT threads are oversubscribed. Allocation is roughly flat across the
 sweep, which is *why* it was never the scaling ceiling — the ceiling was the
 serial merge, a software limit, not memory bandwidth or core count. On real
 disk I/O the gap widens further because parallel writes overlap sorting.
+(v1.0.5 then copies the already-sorted final chunk to the output verbatim
+instead of re-serializing it — ~8% less allocation, ~23.75 MB → ~21.8 MB,
+and a few % faster.)
 
 ## Project Structure
 

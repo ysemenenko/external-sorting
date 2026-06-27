@@ -4,6 +4,19 @@ All notable changes to **ExternalSorting.Core** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.5] — 2026-06-27
+
+### Changed
+- **Final output is now a verbatim byte copy.** The last merged chunk is
+  already in the exact output format (`[int64 count][item]...`), so `Sort()`
+  copies its bytes straight to the output stream instead of deserializing and
+  re-serializing every record. This removes a whole pass of per-record
+  (string) allocation from the hot path.
+  - Measured on the 50K end-to-end benchmark (Ryzen 9800X3D): allocation
+    **~23.75 MB → ~21.8 MB** (~8% less), and ~9–14% faster end-to-end
+    (e.g. P=8 **15.41 ms → 13.30 ms**). Output is byte-identical
+    (`Read ∘ Write` round-trips the format exactly).
+
 ## [1.0.4] — 2026-06-27
 
 ### Added
@@ -87,6 +100,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ISerializer<T>` / `IComparer<T>`, `SortOptions` / `SortMetrics`, and the
   classic "sort 1 GB with 1 MB RAM" demonstration.
 
+[1.0.5]: https://github.com/ysemenenko/external-sorting/releases/tag/v1.0.5
 [1.0.4]: https://github.com/ysemenenko/external-sorting/releases/tag/v1.0.4
 [1.0.3]: https://github.com/ysemenenko/external-sorting/releases/tag/v1.0.3
 [1.0.2]: https://github.com/ysemenenko/external-sorting/releases/tag/v1.0.2
