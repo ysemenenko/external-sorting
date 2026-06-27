@@ -82,7 +82,7 @@ Chunk C:  [4, 6, 7, ...]     ──┼──→  MinHeap (size K=3)  ──→  
 
 **Why MinHeap?** The old implementation used `List.Sort()` on every extraction — O(K log K) per item, O(NK log K) total. MinHeap gives O(N log K), which is orders of magnitude faster for large K (8-way, 16-way merge).
 
-**ReplaceMin fast path.** When the source that just yielded the min still has more data, the merge loop overwrites the heap root in place via `MinHeap.ReplaceMin` (one SiftDown) instead of doing `ExtractMin + Insert` (SiftDown + SiftUp). Measured **30% speedup at K=8 and 34% at K=16** on the merge inner loop — see [Benchmarks](#benchmarks).
+**ReplaceMin fast path.** When the source that just yielded the min still has more data, the merge loop overwrites the heap root in place via `MinHeap.ReplaceMin` (one SiftDown) instead of doing `ExtractMin + Insert` (SiftDown + SiftUp). Measured **26% speedup at both K=8 and K=16** on the merge inner loop — see [Benchmarks](#benchmarks).
 
 #### Phase 1 alternatives — Replacement Selection
 
@@ -119,7 +119,7 @@ Reader (1 thread) ──► [bounded queue, capacity = parallelism × 2] ──�
    per-chunk buffer                                                     ChunkWriter.Write
 ```
 
-The bounded `BlockingCollection` caps in-flight buffers so memory growth is bounded by `~(parallelism + 1) × MaxMemoryBytes`. A linked `CancellationTokenSource` propagates worker faults back to the reader so a disk-full error tears the pipeline down cleanly instead of deadlocking. Measured **1.12× speedup** at the sweet spot (P=4 on a 4-physical-core box) for in-memory workloads — wider for disk-bound ones because writes overlap with sorting.
+The bounded `BlockingCollection` caps in-flight buffers so memory growth is bounded by `~(parallelism + 1) × MaxMemoryBytes`. A linked `CancellationTokenSource` propagates worker faults back to the reader so a disk-full error tears the pipeline down cleanly instead of deadlocking. Measured **1.20× speedup** at the sweet spot (P=4–8) for in-memory workloads — wider for disk-bound ones because writes overlap with sorting.
 
 #### Concrete Example
 
@@ -321,25 +321,29 @@ dotnet run -c Release --project tests/ExternalSorting.Benchmarks -- --filter '*'
 dotnet run -c Release --project tests/ExternalSorting.Benchmarks -- --filter '*MergeBenchmarks*'
 ```
 
+All numbers below were measured on an **AMD Ryzen 7 9800X3D (8 physical /
+16 logical cores), .NET 8.0.28**, ShortRun config (7 warmup + 20 measured
+iterations, margin <1.1% of mean).
+
 Three suites:
 
 ### MergeBenchmarks — `MinHeap.ReplaceMin` vs `ExtractMin + Insert`
 
 Isolates the merge inner loop from disk I/O. K pre-sorted in-memory
-sources, two methods running the same merge with different heap
-operation patterns.
-
-Intel Core i3-10100T, 4 physical cores, .NET 8.0.25:
+sources (1M items merged), two methods running the same merge with
+different heap operation patterns.
 
 | Method | K | Mean | Ratio |
 |---|---|---|---|
-| Merge_ExtractMin_Insert | 8 | 46.92 ms | 1.00 |
-| **Merge_ReplaceMin** | **8** | **32.88 ms** | **0.70** |
-| Merge_ExtractMin_Insert | 16 | 66.13 ms | 1.00 |
-| **Merge_ReplaceMin** | **16** | **43.41 ms** | **0.66** |
+| Merge_ExtractMin_Insert | 8 | 23.91 ms | 1.00 |
+| **Merge_ReplaceMin** | **8** | **17.80 ms** | **0.74** |
+| Merge_ExtractMin_Insert | 16 | 30.55 ms | 1.00 |
+| **Merge_ReplaceMin** | **16** | **22.71 ms** | **0.74** |
 
-`ReplaceMin` is **30–34% faster** on the inner merge loop. The win
-scales slightly with K because deeper heaps = bigger SiftUp savings.
+`ReplaceMin` is **~26% faster** on the inner merge loop at both K. (On a
+smaller-cache Intel i3-10100T the same code measured 30–34% — the X3D's
+large L3 hides more of the memory latency that SiftUp would otherwise
+cost, so the relative win narrows while absolute times roughly halve.)
 
 ### ChunkStrategyBenchmarks — Replacement Selection vs simple chunking
 
@@ -348,15 +352,16 @@ algorithm differs.
 
 | Method | Mean | Allocated | Chunks | Merge passes |
 |---|---|---|---|---|
-| Sort_Simple_Chunking | 63.31 ms | 22.96 MB | 74 | 3 |
-| **Sort_Replacement_Selection** | 63.82 ms | **15.63 MB** | **38** | **2** |
+| Sort_Simple_Chunking | 23.37 ms | 22.96 MB | 74 | 3 |
+| **Sort_Replacement_Selection** | 24.75 ms | **15.63 MB** | **38** | **2** |
 
-RS halves the chunk count and saves a full merge pass on disk.
-Wall-clock time looks identical because the heap operations during
-chunking are more expensive than `Array.Sort` (compensating for the
-merge phase saving on this in-memory benchmark) — but **memory
-allocation drops 32%** and on real disk-bound workloads the one
-fewer merge pass dominates.
+RS halves the chunk count and saves a full merge pass on disk. On this
+in-memory benchmark RS is ~6% slower in wall-clock because the heap
+operations during chunking cost more than `Array.Sort` and the saved
+merge pass never touches a real disk — but **memory allocation drops
+32%** and on real disk-bound workloads the one fewer merge pass
+dominates. (Chunk count and merge passes are algorithm-deterministic, so
+they're identical to any other machine.)
 
 ### SortBenchmarks — `DegreeOfParallelism` sweep
 
@@ -365,16 +370,22 @@ memory (chunk phase dominant) so the parallelism comparison is meaningful.
 
 | Parallelism | Mean | Speedup |
 |---|---|---|
-| 1 (serial) | 61.6 ms | 1.00× |
-| 2 | 57.3 ms | 1.08× |
-| 4 ⭐ | **55.0 ms** | **1.12×** |
-| 8 | 56.7 ms | 1.09× |
+| 1 (serial) | 23.39 ms | 1.00× |
+| 2 | 20.77 ms | 1.13× |
+| 4 ⭐ | **19.54 ms** | **1.20×** |
+| 8 | 19.52 ms | 1.20× |
+| 16 | 20.46 ms | 1.14× |
 
-P=4 is the sweet spot because the test box has 4 physical cores;
-hyperthreading (P=8) adds context-switch overhead that cancels the
-marginal SMT win for this CPU+memory-bound workload. On real disk
-I/O the gap widens because parallel writes overlap with subsequent
-buffer sorting.
+Scaling reaches a plateau at P=4 and holds flat through P=8 (this box has
+8 physical cores), then **regresses at P=16** — once every SMT thread is
+oversubscribed, context-switch and GC contention outweigh the marginal
+SMT win. P=4 is flagged as the sweet spot because it already hits the
+plateau speed with half the threads (best efficiency). Note the ceiling
+isn't the core count: the workload is allocation/GC-bound (~23.75 MB
+allocated per sort, heavy Gen0/1/2), so the shared memory subsystem
+saturates around 4 parallel sorters regardless of how many cores are
+free. On real disk I/O the gap widens because parallel writes overlap
+with subsequent buffer sorting.
 
 ## Project Structure
 
@@ -393,8 +404,8 @@ external-sorting/
 
 - **Generic `T`**: Sort any type, not just strings — plug in your own `ISerializer<T>` and `IComparer<T>`
 - **MinHeap merge**: O(N log K) vs old code's O(NK log K) — orders of magnitude faster for large K
-- **`ReplaceMin` fast path**: merge inner loop overwrites the heap root in place when the source still has data, saving the SiftUp half of an `ExtractMin + Insert` pair (30–34% measured speedup, see [Benchmarks](#benchmarks))
-- **Three chunk strategies**: serial (lowest GC), parallel pipeline (default, ~1.12× speedup), Replacement Selection (~50% fewer chunks for random input). Dispatcher picks one in `SortOptions`.
+- **`ReplaceMin` fast path**: merge inner loop overwrites the heap root in place when the source still has data, saving the SiftUp half of an `ExtractMin + Insert` pair (~26% measured speedup, see [Benchmarks](#benchmarks))
+- **Three chunk strategies**: serial (lowest GC), parallel pipeline (default, ~1.20× speedup), Replacement Selection (~50% fewer chunks for random input). Dispatcher picks one in `SortOptions`.
 - **Binary format**: 3-5x faster I/O than text parsing
 - **Memory-adaptive chunking**: Chunk size computed from `MaxMemoryBytes / EstimatedItemSize`
 - **Automatic cleanup**: Temp directory deleted in `finally` block, `ChunkFile` implements `IDisposable`

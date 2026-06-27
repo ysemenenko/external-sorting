@@ -36,7 +36,7 @@ public class SortBenchmarks
     [Params(50_000)]
     public int RecordCount { get; set; }
 
-    [Params(1, 2, 4, 8)]
+    [Params(1, 2, 4, 8, 16)]
     public int Parallelism { get; set; }
 
     private byte[] _inputBytes = Array.Empty<byte>();
