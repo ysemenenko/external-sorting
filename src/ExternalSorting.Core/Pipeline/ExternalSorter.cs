@@ -493,37 +493,69 @@ public sealed class ExternalSorter<T> : IExternalSorter<T>
                              SortMetrics metrics, CancellationToken ct)
     {
         int mergeWay = _options.MergeWayCount;
+        int parallelism = Math.Max(1, _options.DegreeOfParallelism);
         int passIndex = 0;
 
-        // Multi-pass merge until single output
+        // Multi-pass merge until a single chunk remains. Within ONE pass the
+        // batches are independent — each reads its own group of chunk files and
+        // writes one merged output — so they run concurrently. This is what
+        // lifts the old serial-merge ceiling: the merge phase used to be fully
+        // single-threaded (Amdahl's law capped the end-to-end speedup no matter
+        // how many cores were free). Passes stay sequential (pass N+1 consumes
+        // pass N's output); the unavoidable serial tail is the last 1-batch
+        // pass plus WriteFinalOutput.
+        //
+        // Memory note: peak merge RAM scales with `parallelism` — up to that
+        // many MergeBatch calls run at once, each holding mergeWay ChunkReaders
+        // (BufferSize each) plus a small heap.
         while (chunks.Count > 1)
         {
             ct.ThrowIfCancellationRequested();
 
-            var nextChunks = new List<ChunkFile>();
-
+            // Slice the pass into batches up front so each gets a stable output
+            // slot — results stay ordered regardless of completion order.
+            var batches = new List<List<ChunkFile>>();
             for (int i = 0; i < chunks.Count; i += mergeWay)
             {
-                ct.ThrowIfCancellationRequested();
-
                 int end = Math.Min(i + mergeWay, chunks.Count);
-                var batch = chunks.GetRange(i, end - i);
-
-                if (batch.Count == 1)
-                {
-                    nextChunks.Add(batch[0]);
-                    continue;
-                }
-
-                var merged = MergeBatch(batch, tempDir, passIndex, i / mergeWay);
-                nextChunks.Add(merged);
-
-                // Dispose source chunks (delete temp files)
-                foreach (var c in batch)
-                    c.Dispose();
+                batches.Add(chunks.GetRange(i, end - i));
             }
 
-            chunks = nextChunks;
+            var nextChunks = new ChunkFile[batches.Count];
+            int capturedPass = passIndex;
+
+            if (parallelism == 1 || batches.Count == 1)
+            {
+                // Single core, or a single trailing batch — nothing to fan out.
+                for (int b = 0; b < batches.Count; b++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    nextChunks[b] = MergeOrCarry(batches[b], tempDir, capturedPass, b);
+                }
+            }
+            else
+            {
+                var po = new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = parallelism,
+                    CancellationToken = ct,
+                };
+                try
+                {
+                    Parallel.For(0, batches.Count, po, b =>
+                    {
+                        nextChunks[b] = MergeOrCarry(batches[b], tempDir, capturedPass, b);
+                    });
+                }
+                catch (AggregateException ae) when (ae.InnerExceptions.Count == 1)
+                {
+                    // Surface the real fault (IOException etc.) with its stack,
+                    // not a generic AggregateException wrapper.
+                    ExceptionDispatchInfo.Throw(ae.InnerExceptions[0]);
+                }
+            }
+
+            chunks = nextChunks.ToList();
             metrics.MergePasses++;
             passIndex++;
 
@@ -537,6 +569,21 @@ public sealed class ExternalSorter<T> : IExternalSorter<T>
             WriteFinalOutput(chunks[0], output);
             chunks[0].Dispose();
         }
+    }
+
+    // Merge a batch into one chunk, or carry a lone already-sorted chunk
+    // forward untouched. Source chunks are disposed (temp files deleted) only
+    // after a successful merge; a carried chunk is NOT disposed (it lives on in
+    // the next pass).
+    private ChunkFile MergeOrCarry(List<ChunkFile> batch, string tempDir, int pass, int batchIndex)
+    {
+        if (batch.Count == 1)
+            return batch[0];
+
+        var merged = MergeBatch(batch, tempDir, pass, batchIndex);
+        foreach (var c in batch)
+            c.Dispose();
+        return merged;
     }
 
     private ChunkFile MergeBatch(List<ChunkFile> batch, string tempDir, int pass, int batchIndex)

@@ -251,6 +251,38 @@ public class RobustnessTests : IDisposable
         await complete.Should().ThrowAsync<OperationCanceledException>();
     }
 
+    // ---------------- parallel merge correctness ----------------
+
+    // Deep multi-pass merge (mergeWay=2, tiny memory → many chunks/passes)
+    // at high parallelism must be byte-identical to the single-threaded sort —
+    // guards the now-concurrent per-pass batch merge.
+    [Fact]
+    public void Parallel_deep_merge_matches_serial_and_is_sorted()
+    {
+        var records = Enumerable.Range(0, 20000)
+            .Select(i => new SortRecord((ulong)((i * 7919) % 20000), $"v{(i * 104729) % 50000:D5}"))
+            .ToArray();
+
+        byte[] Sort(int dop)
+        {
+            using var input = WriteRecords(records);
+            using var output = new MemoryStream();
+            new ExternalSorter<SortRecord>(_serializer, Comparer<SortRecord>.Default,
+                Opts(mergeWay: 2, mem: 1024, dop: dop)).Sort(input, output);
+            return output.ToArray();
+        }
+
+        var parallel = Sort(8);
+        var serial = Sort(1);
+
+        parallel.Should().Equal(serial, "parallel merge must produce byte-identical output");
+
+        using var ms = new MemoryStream(parallel);
+        var result = ReadOutput(ms);
+        result.Should().HaveCount(records.Length);
+        result.Should().BeInAscendingOrder(Comparer<SortRecord>.Default);
+    }
+
     // ---------------- helpers ----------------
 
     private MemoryStream WriteRecords(params SortRecord[] records)

@@ -119,7 +119,7 @@ Reader (1 thread) ──► [bounded queue, capacity = parallelism × 2] ──�
    per-chunk buffer                                                     ChunkWriter.Write
 ```
 
-The bounded `BlockingCollection` caps in-flight buffers so memory growth is bounded by `~(parallelism + 1) × MaxMemoryBytes`. A linked `CancellationTokenSource` propagates worker faults back to the reader so a disk-full error tears the pipeline down cleanly instead of deadlocking. Measured **1.20× speedup** at the sweet spot (P=4–8) for in-memory workloads — wider for disk-bound ones because writes overlap with sorting.
+The bounded `BlockingCollection` caps in-flight buffers so memory growth is bounded by `~(parallelism + 1) × MaxMemoryBytes`. A linked `CancellationTokenSource` propagates worker faults back to the reader so a disk-full error tears the pipeline down cleanly instead of deadlocking. The multi-pass merge is also parallel — the independent per-pass batches merge concurrently — so chunking and merging both scale; combined they reach **~1.54× end-to-end** at the P=4–8 sweet spot for in-memory workloads (see [Benchmarks](#benchmarks)), wider for disk-bound ones because writes overlap with sorting.
 
 #### Concrete Example
 
@@ -171,7 +171,7 @@ Time: 9.8s (6.1s chunking + 3.3s merging)
 ## Installation
 
 ```bash
-dotnet add package ExternalSorting.Core --version 1.0.3
+dotnet add package ExternalSorting.Core --version 1.0.4
 ```
 
 ## Quick Start
@@ -366,26 +366,30 @@ they're identical to any other machine.)
 ### SortBenchmarks — `DegreeOfParallelism` sweep
 
 End-to-end sort of a 50K-record in-memory dataset with tiny per-chunk
-memory (chunk phase dominant) so the parallelism comparison is meaningful.
+memory (~74 chunks, 3 merge passes) so the parallelism comparison is
+meaningful. **Both columns were measured on the same Ryzen 9800X3D with the
+same config — only the merge implementation differs**, so the delta isolates
+the code change, not a hardware change.
 
-| Parallelism | Mean | Speedup |
-|---|---|---|
-| 1 (serial) | 23.39 ms | 1.00× |
-| 2 | 20.77 ms | 1.13× |
-| 4 ⭐ | **19.54 ms** | **1.20×** |
-| 8 | 19.52 ms | 1.20× |
-| 16 | 20.46 ms | 1.14× |
+| Parallelism | Serial merge | Parallel merge | Speedup (parallel) |
+|---|---|---|---|
+| 1 (serial) | 23.72 ms | 23.70 ms | 1.00× |
+| 2 | 21.12 ms | 17.93 ms | 1.32× |
+| 4 | 19.82 ms | 15.75 ms | 1.50× |
+| 8 ⭐ | 20.20 ms | **15.41 ms** | **1.54×** |
+| 16 | 20.90 ms | 15.73 ms | 1.51× |
 
-Scaling reaches a plateau at P=4 and holds flat through P=8 (this box has
-8 physical cores), then **regresses at P=16** — once every SMT thread is
-oversubscribed, context-switch and GC contention outweigh the marginal
-SMT win. P=4 is flagged as the sweet spot because it already hits the
-plateau speed with half the threads (best efficiency). Note the ceiling
-isn't the core count: the workload is allocation/GC-bound (~23.75 MB
-allocated per sort, heavy Gen0/1/2), so the shared memory subsystem
-saturates around 4 parallel sorters regardless of how many cores are
-free. On real disk I/O the gap widens because parallel writes overlap
-with subsequent buffer sorting.
+Originally only chunk creation ran in parallel; the multi-pass merge was
+fully single-threaded, so **Amdahl's law capped the end-to-end speedup at
+~1.20×** no matter how many cores were free (the "Serial merge" column).
+Merging the independent per-pass batches concurrently lifted that to
+**~1.54×** and moved the sweet spot from P=4 to the P=4–8 plateau —
+roughly **−24% wall-clock at P=8**. The remaining serial tail is the last
+single-batch pass plus the final output write; P=16 dips slightly because
+the 16 SMT threads are oversubscribed. Allocation stays ~23.75 MB across the
+sweep, which is *why* it was never the scaling ceiling — the ceiling was the
+serial merge, a software limit, not memory bandwidth or core count. On real
+disk I/O the gap widens further because parallel writes overlap sorting.
 
 ## Project Structure
 
@@ -405,7 +409,7 @@ external-sorting/
 - **Generic `T`**: Sort any type, not just strings — plug in your own `ISerializer<T>` and `IComparer<T>`
 - **MinHeap merge**: O(N log K) vs old code's O(NK log K) — orders of magnitude faster for large K
 - **`ReplaceMin` fast path**: merge inner loop overwrites the heap root in place when the source still has data, saving the SiftUp half of an `ExtractMin + Insert` pair (~26% measured speedup, see [Benchmarks](#benchmarks))
-- **Three chunk strategies**: serial (lowest GC), parallel pipeline (default, ~1.20× speedup), Replacement Selection (~50% fewer chunks for random input). Dispatcher picks one in `SortOptions`.
+- **Three chunk strategies**: serial (lowest GC), parallel pipeline (default), Replacement Selection (~50% fewer chunks for random input). Dispatcher picks one in `SortOptions`. With the parallel merge this scales to **~1.54× end-to-end**.
 - **Binary format**: 3-5x faster I/O than text parsing
 - **Memory-adaptive chunking**: Chunk size computed from `MaxMemoryBytes / EstimatedItemSize`
 - **Automatic cleanup**: Temp directory deleted in `finally` block, `ChunkFile` implements `IDisposable`
