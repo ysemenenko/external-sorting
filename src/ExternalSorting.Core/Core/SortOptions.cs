@@ -2,7 +2,13 @@ namespace ExternalSorting.Core;
 
 public sealed class SortOptions
 {
-    /// <summary>Maximum memory (bytes) for in-memory chunk sorting. Default: 256 MB.</summary>
+    /// <summary>
+    /// Global estimated item-memory budget for chunk creation, shared by all
+    /// buffers (including queued and actively sorted chunks). Default: 256 MB.
+    /// Uses ISerializer.EstimatedItemSize; at least one item is allowed even
+    /// when its estimate exceeds the budget. Excludes runtime/collection overhead,
+    /// I/O buffers and merge memory; this is not a hard process RAM limit.
+    /// </summary>
     public long MaxMemoryBytes { get; init; } = 256 * 1024 * 1024;
 
     /// <summary>Number of chunks merged per pass. Default: 8 (8-way merge).</summary>

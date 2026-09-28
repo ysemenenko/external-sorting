@@ -7,9 +7,10 @@
 
     <!-- NuGet package metadata -->
     <PackageId>ExternalSorting.Core</PackageId>
-    <Version>1.0.5</Version>
+    <Version>1.0.6</Version>
     <Authors>Yaroslav Semenenko</Authors>
-    <Description>K-way external merge sort for .NET 8. Sort datasets larger than available memory using binary min-heap merge. v1.0.5 copies the already-sorted final chunk to the output verbatim instead of re-serializing it (one fewer deserialization pass — ~8% less allocation, faster). Builds on the v1.0.4 parallel merge (~1.54x end-to-end vs the old serial-merge ~1.20x ceiling) plus option validation, leak-safe streams, Int64 counts for billion-record sorts, real BytesRead/BytesWritten metrics, pipelined parallel chunk creation, Knuth's Replacement Selection, and a ReplaceMin merge fast path. Generic IExternalSorter&lt;T&gt; — plug in any record type, comparer, and serializer.</Description>
+    <Description>K-way external merge sort for .NET 8. Sort datasets larger than available memory using parallel chunk sorting and binary min-heap merge. v1.0.6 shares one estimated item-memory budget across a bounded pool of reusable chunk buffers, with cancellation-aware waits and worker cleanup on failure. Includes parallel multi-pass merge, Knuth's Replacement Selection, Int64 record counts and sort metrics. Generic IExternalSorter&lt;T&gt; — plug in any record type, comparer, and serializer.</Description>
+    <PackageReleaseNotes>1.0.6: MaxMemoryBytes is now a global estimated item-memory budget for chunk creation. Parallel sorting uses bounded reusable buffers; cancellation and failures drain workers before cleanup. Public API and binary format are unchanged. See CHANGELOG.md for budget exclusions and compatibility details.</PackageReleaseNotes>
     <PackageTags>external-sort;merge-sort;k-way-merge;large-file;disk-sort;out-of-core;sorting</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://ysemenenko.github.io/external-sorting/</PackageProjectUrl>

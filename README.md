@@ -2,7 +2,7 @@
 
 [![NuGet](https://img.shields.io/nuget/v/ExternalSorting.Core.svg)](https://www.nuget.org/packages/ExternalSorting.Core)
 
-Sort 1 GB of data with 1 MB of RAM. K-way external merge sort implementation using binary min-heap.
+Sort 1 GB of data with a 1 MB estimated chunk-memory budget. K-way external merge sort implementation using binary min-heap.
 
 [Source code on GitHub](https://github.com/ysemenenko/external-sorting)
 
@@ -38,6 +38,9 @@ ExternalSorting.Core/
 External merge sort handles datasets that don't fit in RAM by splitting the work into two phases: **chunk creation** (fits in memory) and **multi-pass merging** (disk-based).
 
 #### Phase 1 — Chunk Creation
+
+The serial path below uses the full item budget for one buffer. Parallel
+chunk creation divides that same budget across a reusable buffer pool.
 
 ```
 Input stream (N items, unsorted)
@@ -113,17 +116,26 @@ Opt in via `SortOptions.UseReplacementSelection = true`. Inherently single-threa
 When `SortOptions.DegreeOfParallelism > 1`, chunk creation runs as a producer/consumer pipeline:
 
 ```
-Reader (1 thread) ──► [bounded queue, capacity = parallelism × 2] ──► Workers (N threads)
+Reader (1 thread) ──► [bounded queue of pooled buffers] ──► Workers (N threads)
        │                                                                    │
    read input into                                                      buffer.Sort() +
    per-chunk buffer                                                     ChunkWriter.Write
 ```
 
-The bounded `BlockingCollection` caps in-flight buffers so memory growth is bounded by `~(parallelism + 1) × MaxMemoryBytes`. A linked `CancellationTokenSource` propagates worker faults back to the reader so a disk-full error tears the pipeline down cleanly instead of deadlocking. The multi-pass merge is also parallel — the independent per-pass batches merge concurrently — so chunking and merging both scale; combined they reach **~1.54× end-to-end** at the P=4–8 sweet spot for in-memory workloads (see [Benchmarks](#benchmarks)), wider for disk-bound ones because writes overlap with sorting.
+`MaxMemoryBytes` is a global estimated item-memory budget for chunk creation. The item budget (`MaxMemoryBytes / EstimatedItemSize`, clamped to `[1, int.MaxValue]`) is divided across up to `DegreeOfParallelism + 1` reusable buffers. Their total capacity fits the budget, including buffers being filled, queued, sorted or written. The reader waits for a free buffer; workers clear and return buffers after writing. Small budgets reduce concurrency, with a minimum of one item even if its estimate exceeds the budget. Runtime/collection overhead, I/O buffers and merge memory are excluded; this is not a hard process RAM limit. More parallelism can produce smaller chunks and more merge work.
+
+A linked `CancellationTokenSource` propagates worker faults back to the reader, cancelling waits for buffers or queue space. Workers are joined before temporary files are cleaned up. The multi-pass merge remains parallel; independent batches within each pass merge concurrently. The benchmark results below predate the shared memory budget.
+
+For example, a budget of 25 estimated items with `DegreeOfParallelism = 4`
+creates five buffers of five items each. No additional chunk buffer is
+allocated while those buffers are occupied. With only two item slots, the
+pool is reduced to two single-item buffers regardless of the requested
+parallelism. Serial chunking and replacement selection retain their existing
+item-budget calculation.
 
 #### Concrete Example
 
-Sort 10M records with 64 MB memory, 8-way merge:
+Sort 10M records with 64 MB memory, 8-way merge, and `DegreeOfParallelism = 1`:
 
 ```
 Input: 10,000,000 records (158 MB on disk)
@@ -171,10 +183,12 @@ Time: 9.8s (6.1s chunking + 3.3s merging)
 ## Installation
 
 ```bash
-dotnet add package ExternalSorting.Core --version 1.0.5
+dotnet add package ExternalSorting.Core --version 1.0.6
 ```
 
 See [CHANGELOG.md](CHANGELOG.md) for the full release history.
+
+The shared chunk-memory budget described here is introduced in **1.0.6**.
 
 ## Quick Start
 
@@ -182,7 +196,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 # Build
 dotnet build
 
-# Run tests (71 tests)
+# Run tests (84 tests)
 dotnet test
 
 # Sort 100K records (quick check)
@@ -225,12 +239,12 @@ var serializer = new RecordSerializer();
 var comparer = Comparer<SortRecord>.Default;
 var options = new SortOptions
 {
-    MaxMemoryBytes = 64 * 1024 * 1024,  // 64 MB
+    MaxMemoryBytes = 64 * 1024 * 1024,  // 64 MB shared estimated chunk budget
     MergeWayCount = 8,
     BufferSize = 64 * 1024,             // FileStream buffer
 
-    // Phase 3.1 — pipelined parallel chunk creation. One reader thread
-    // feeds N sort+write workers via a bounded queue. Default = ProcessorCount.
+    // One reader feeds parallel sort+write workers using a bounded buffer pool.
+    // All chunk buffers share MaxMemoryBytes. Default = ProcessorCount.
     DegreeOfParallelism = Environment.ProcessorCount,
 
     // Phase 3.2 — Replacement Selection. Produces ~2x larger runs on
@@ -247,18 +261,18 @@ using var input = File.OpenRead("input.bin");
 using var output = File.Create("output.bin");
 sorter.Sort(input, output);
 
-Console.WriteLine(sorter.LastMetrics); // Items: 1,000,000, Chunks: 3, ...
+Console.WriteLine(sorter.LastMetrics); // Chunk count depends on budget and parallelism.
 ```
 
 #### Picking a chunk strategy
 
 | Workload | Recommended | Why |
 |---|---|---|
-| Default / unknown | parallel (default) | linear-ish speedup with cores, no algorithm risk |
+| Default / unknown | parallel (default) | concurrent sorting and writing within one shared chunk budget |
 | Memory-constrained, random input | `UseReplacementSelection = true` | ~50% fewer chunks → one fewer merge pass → less disk I/O |
 | Mostly-sorted input | `UseReplacementSelection = true` | best case collapses entire stream into a single run |
-| Reverse-sorted input | parallel | RS degenerates to *M*-sized runs, parallel still wins |
-| Single-core or strict memory cap | `DegreeOfParallelism = 1` | original serial path, single recycled buffer, lowest GC |
+| Reverse-sorted input | simple chunking | RS degenerates to *M*-sized runs; choose parallelism for the available budget |
+| Single-core or fewer, larger chunks | `DegreeOfParallelism = 1` | one recycled buffer uses the full item budget |
 
 ### Custom record types
 
@@ -277,6 +291,10 @@ public class LogSerializer : ISerializer<LogEntry>
 
 ## Performance
 
+These historical measurements predate the shared chunk-memory budget. Chunk
+counts, merge passes and timings can change with the new parallel behavior;
+the table is not a benchmark of version 1.0.6.
+
 | Records | Data Size | Memory | Merge | Chunks | Passes | Time | Verified |
 |---------|-----------|--------|-------|--------|--------|------|----------|
 | 100K | 1.6 MB | 8 MB | 4-way | 1 | 0 | 0.1s | OK |
@@ -284,11 +302,12 @@ public class LogSerializer : ISerializer<LogEntry>
 | 10M | 158 MB | 64 MB | 8-way | 8 | 1 | 9.8s | OK |
 | **60M** | **948 MB** | **1 MB** | **8-way** | **2,747** | **4** | **84s** | **OK** |
 
-The last row demonstrates the core interview problem: **sort 1 GB of data with only 1 MB of RAM** — a classic system design / algorithms challenge.
+The last row demonstrates sorting about 1 GB of data with a 1 MB chunk budget.
+That budget does not include I/O buffers, merge memory or runtime overhead.
 
 ## Tests
 
-71 tests covering:
+84 tests covering:
 - **MinHeap**: insert, extract, duplicates, replace, 10K random
 - **Serializer**: binary roundtrip, text parse/format, comparison logic
 - **Chunk I/O**: write/read roundtrip, empty, dispose cleanup, 10K items
@@ -301,8 +320,8 @@ The last row demonstrates the core interview problem: **sort 1 GB of data with o
     correctness on 5K random, cancellation
   - **Parallel chunk creation**: byte-identical output across
     `DegreeOfParallelism` ∈ {1,2,4,8} (Theory), 25-iteration
-    determinism stress (max contention), chunk count invariant
-    across parallelism, pre-cancelled CT unblocks pipeline cleanly,
+    determinism stress (max contention), chunk count reflects division
+    of the shared budget, pre-cancelled CT unblocks pipeline cleanly,
     RS overrides parallelism when both options are set
   - **Parallel merge**: deep multi-pass merge (mergeWay=2, DOP=8) is
     byte-identical to serial and fully sorted
@@ -310,10 +329,19 @@ The last row demonstrates the core interview problem: **sort 1 GB of data with o
     chunk strategies, fault path drains blocked workers (cross-platform),
     Int64-header round-trip, truncated-input EOF, `leaveOpen`, byte metrics
 - **DataGenerator**: binary/text generation, deterministic seed
+- **Memory budget** (13 new cases): bounded input read-ahead while writers
+  are blocked, tiny budgets and extreme parallelism, concurrent chunk sorting,
+  cancellation while waiting for a buffer, and read/write/comparer/callback
+  failures. Synchronization tests run separately from other test collections
+  to avoid ThreadPool contention from unrelated workloads.
 
 ```bash
 dotnet test
 ```
+
+Latest validation: **84 passed, 0 failed**, .NET SDK **8.0.425**, with
+`DOTNET_PROCESSOR_COUNT=4`. No test filter was used; explicitly configured
+`DegreeOfParallelism` values are unaffected by this environment setting.
 
 ## Benchmarks
 
@@ -328,7 +356,8 @@ dotnet run -c Release --project tests/ExternalSorting.Benchmarks -- --filter '*'
 dotnet run -c Release --project tests/ExternalSorting.Benchmarks -- --filter '*MergeBenchmarks*'
 ```
 
-All numbers below were measured on an **AMD Ryzen 7 9800X3D (8 physical /
+The historical numbers below predate the shared memory budget and were
+measured on an **AMD Ryzen 7 9800X3D (8 physical /
 16 logical cores), .NET 8.0.28**, ShortRun config (7 warmup + 20 measured
 iterations, margin <1.1% of mean).
 
@@ -410,7 +439,7 @@ external-sorting/
 │   ├── ExternalSorting.Core/         — library (algorithm + I/O)
 │   └── ExternalSorting.Console/      — CLI application
 └── tests/
-    ├── ExternalSorting.Tests/        — xUnit + FluentAssertions (71 tests)
+    ├── ExternalSorting.Tests/        — xUnit + FluentAssertions (84 tests)
     └── ExternalSorting.Benchmarks/   — BenchmarkDotNet perf suites
 ```
 
@@ -419,9 +448,9 @@ external-sorting/
 - **Generic `T`**: Sort any type, not just strings — plug in your own `ISerializer<T>` and `IComparer<T>`
 - **MinHeap merge**: O(N log K) vs old code's O(NK log K) — orders of magnitude faster for large K
 - **`ReplaceMin` fast path**: merge inner loop overwrites the heap root in place when the source still has data, saving the SiftUp half of an `ExtractMin + Insert` pair (~26% measured speedup, see [Benchmarks](#benchmarks))
-- **Three chunk strategies**: serial (lowest GC), parallel pipeline (default), Replacement Selection (~50% fewer chunks for random input). Dispatcher picks one in `SortOptions`. With the parallel merge this scales to **~1.54× end-to-end**.
+- **Three chunk strategies**: serial (one recycled buffer), parallel pipeline (default, shared buffer pool), Replacement Selection (longer runs on random input). Dispatcher picks one in `SortOptions`; the best choice depends on the workload and budget.
 - **Binary format**: 3-5x faster I/O than text parsing
-- **Memory-adaptive chunking**: Chunk size computed from `MaxMemoryBytes / EstimatedItemSize`
+- **Memory-adaptive chunking**: One estimated item budget (`MaxMemoryBytes / EstimatedItemSize`) shared across all chunk buffers
 - **Automatic cleanup**: Temp directory deleted in `finally` block, `ChunkFile` implements `IDisposable`
 - **CancellationToken**: Cooperative cancellation at chunk and merge boundaries; parallel pipeline uses a linked CTS so a worker fault unblocks the reader instead of deadlocking
 - **Progress reporting**: Callback with phase + percentage for UI integration

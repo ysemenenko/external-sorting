@@ -4,6 +4,40 @@ All notable changes to **ExternalSorting.Core** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.6] — 2026-09-28
+
+### Fixed
+- **Global memory budget for chunk creation.** `MaxMemoryBytes` is now shared
+  across all chunk buffers, including those being filled, queued, sorted and
+  written. Parallel workers no longer each receive a full-budget buffer.
+- Waiting for a free buffer observes cancellation. Reader, comparer, writer
+  and progress-callback failures cancel the pipeline and drain workers before
+  temporary files are removed. Input validation happens before workers start.
+
+### Changed
+- Parallel chunk creation uses a per-sort pool of at most
+  `DegreeOfParallelism + 1` reusable buffers. Workers clear and return each
+  buffer after writing; small budgets reduce the number of buffers and workers.
+- The item budget is `MaxMemoryBytes / EstimatedItemSize`, clamped to
+  `[1, int.MaxValue]`, and divided among the buffers. At least one item remains
+  supported even when its estimate exceeds the budget. Runtime/collection
+  overhead, I/O buffers and merge memory are excluded from this estimate.
+- Increasing parallelism can now produce smaller chunks and more merge work.
+  Historical benchmark results have not been re-measured for this change.
+
+### Added
+- 13 tests for the shared budget under blocked writers, tiny budgets, extreme
+  parallelism, concurrent chunk sorting, cancellation while waiting for a
+  buffer, and failures in reading, writing, comparison and progress callbacks.
+  The existing chunk-count test now checks division of the shared budget.
+- Validation: all **84 tests passed** with .NET SDK 8.0.425 and
+  `DOTNET_PROCESSOR_COUNT=4`; tests with explicit parallelism keep their values.
+
+### Compatibility
+- Public API signatures and the binary format are unchanged. Serial chunking
+  and replacement selection retain their existing item-budget calculation.
+- The NuGet package version is **1.0.6**.
+
 ## [1.0.5] — 2026-06-27
 
 ### Changed
@@ -100,6 +134,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ISerializer<T>` / `IComparer<T>`, `SortOptions` / `SortMetrics`, and the
   classic "sort 1 GB with 1 MB RAM" demonstration.
 
+[1.0.6]: https://github.com/ysemenenko/external-sorting/releases/tag/v1.0.6
 [1.0.5]: https://github.com/ysemenenko/external-sorting/releases/tag/v1.0.5
 [1.0.4]: https://github.com/ysemenenko/external-sorting/releases/tag/v1.0.4
 [1.0.3]: https://github.com/ysemenenko/external-sorting/releases/tag/v1.0.3

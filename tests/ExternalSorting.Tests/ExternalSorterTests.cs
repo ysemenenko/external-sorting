@@ -524,12 +524,9 @@ public class ExternalSorterTests : IDisposable
     }
 
     [Fact]
-    public void Sort_parallel_chunk_count_matches_serial()
+    public void Sort_parallel_chunk_count_reflects_shared_budget()
     {
-        // ChunksCreated metric should be the same regardless of
-        // parallelism — same input, same chunk capacity, same number
-        // of full buffers. Catches off-by-one errors in chunk index
-        // assignment under concurrent worker reads.
+        // 25 item slots are divided between workers and the producer.
         var rng = new Random(101);
         var records = Enumerable.Range(0, 500)
             .Select(_ => new SortRecord((ulong)rng.NextInt64(), $"x{rng.Next(20)}"))
@@ -551,10 +548,10 @@ public class ExternalSorterTests : IDisposable
             return sorter.LastMetrics!.ChunksCreated;
         }
 
-        int serialChunks = CountChunks(1);
-        CountChunks(2).Should().Be(serialChunks);
-        CountChunks(4).Should().Be(serialChunks);
-        CountChunks(8).Should().Be(serialChunks);
+        CountChunks(1).Should().Be(20);  // capacity 25
+        CountChunks(2).Should().Be(63);  // capacity 8
+        CountChunks(4).Should().Be(100); // capacity 5
+        CountChunks(8).Should().Be(250); // capacity 2
     }
 
     [Fact]

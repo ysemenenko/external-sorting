@@ -347,19 +347,31 @@ public sealed class ExternalSorter<T> : IExternalSorter<T>
         Stream input, string tempDir, SortMetrics metrics,
         CancellationToken ct, int parallelism)
     {
-        // Pipelined chunk creation: one reader thread streams items off
-        // *input* and hands fully-filled buffers to a worker pool that
-        // sorts each buffer and writes the chunk to disk in parallel.
-        // The bounded BlockingCollection caps in-flight buffers at
-        // parallelism*2 so we don't run away from MaxMemoryBytes by
-        // an unbounded amount under producer-faster-than-consumers.
-        //
-        // Memory note: peak RAM during this phase is approximately
-        // (parallelism+1) * (MaxMemoryBytes / EstimatedItemSize) items
-        // — one buffer being filled by the reader, and up to parallelism
-        // more being processed by workers. Document this in SortOptions
-        // if you need to dial it back further.
-        int chunkCapacity = ComputeChunkCapacity();
+        // Share one item budget between producer, queued chunks and workers.
+        // Reserve up to one buffer per worker plus one for the producer.
+        // Tiny budgets reduce concurrency; retain the one-item minimum.
+        ct.ThrowIfCancellationRequested();
+        // Validate the input before starting workers that would wait on the queue.
+        using var reader = new BinaryReader(input, Encoding.UTF8, leaveOpen: true);
+        int itemBudget = ComputeChunkCapacity();
+        int bufferCount = (int)Math.Min(itemBudget, (long)parallelism + 1);
+        int chunkCapacity = itemBudget / bufferCount;
+        parallelism = Math.Min(parallelism, bufferCount);
+
+        using var available = new BlockingCollection<List<T>>(bufferCount);
+        for (int i = 0; i < bufferCount; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            available.Add(new List<T>(chunkCapacity));
+        }
+
+        void ReturnBuffer(List<T> buffer)
+        {
+            buffer.Clear(); // release references while retaining the backing array
+            // Each owner returns exactly once, so a free slot always exists.
+            // Do not use a cancellation token: returning ownership must succeed.
+            available.Add(buffer);
+        }
 
         // Linked CTS so a worker can fault the pipeline and unblock the
         // reader (otherwise a worker dying with disk-full would leave
@@ -368,7 +380,7 @@ public sealed class ExternalSorter<T> : IExternalSorter<T>
         var combinedCt = workerCts.Token;
 
         using var queue = new BlockingCollection<(int Index, List<T> Buffer)>(
-            boundedCapacity: parallelism * 2);
+            boundedCapacity: bufferCount);
         var resultBag = new ConcurrentBag<ChunkFile>();
 
         var workers = new Task[parallelism];
@@ -380,10 +392,19 @@ public sealed class ExternalSorter<T> : IExternalSorter<T>
                 {
                     foreach (var (idx, buf) in queue.GetConsumingEnumerable(combinedCt))
                     {
-                        buf.Sort(_comparer);
-                        var chunk = ChunkWriter.Write(
-                            buf, _serializer, tempDir, idx, _options.BufferSize);
-                        resultBag.Add(chunk);
+                        try
+                        {
+                            combinedCt.ThrowIfCancellationRequested();
+                            buf.Sort(_comparer);
+                            combinedCt.ThrowIfCancellationRequested();
+                            var chunk = ChunkWriter.Write(
+                                buf, _serializer, tempDir, idx, _options.BufferSize);
+                            resultBag.Add(chunk);
+                        }
+                        finally
+                        {
+                            ReturnBuffer(buf);
+                        }
                     }
                 }
                 catch
@@ -396,9 +417,6 @@ public sealed class ExternalSorter<T> : IExternalSorter<T>
             });
         }
 
-        // leaveOpen: the caller owns `input`. `using` disposes the reader
-        // whether this method returns normally or via exception.
-        using var reader = new BinaryReader(input, Encoding.UTF8, leaveOpen: true);
         int chunkIndex = 0;
         try
         {
@@ -407,29 +425,36 @@ public sealed class ExternalSorter<T> : IExternalSorter<T>
                 while (true)
                 {
                     combinedCt.ThrowIfCancellationRequested();
-                    // Allocate a fresh buffer per chunk — workers process
-                    // them concurrently so we cannot reuse the serial path's
-                    // single recycled buffer.
-                    var buffer = new List<T>(chunkCapacity);
-                    for (int i = 0; i < chunkCapacity; i++)
+                    var buffer = available.Take(combinedCt);
+                    bool handedOff = false;
+                    try
                     {
-                        try
+                        for (int i = 0; i < chunkCapacity; i++)
                         {
-                            buffer.Add(_serializer.Read(reader));
+                            combinedCt.ThrowIfCancellationRequested();
+                            try
+                            {
+                                buffer.Add(_serializer.Read(reader));
+                            }
+                            catch (EndOfStreamException)
+                            {
+                                break;
+                            }
                         }
-                        catch (EndOfStreamException)
-                        {
+                        if (buffer.Count == 0)
                             break;
-                        }
-                    }
-                    if (buffer.Count == 0)
-                        break;
 
-                    int count = buffer.Count;
-                    queue.Add((chunkIndex++, buffer), combinedCt);
-                    metrics.TotalItems += count;
-                    metrics.ChunksCreated++;
-                    _options.OnProgress?.Invoke(SortPhase.ChunkCreation, -1);
+                        int count = buffer.Count;
+                        queue.Add((chunkIndex++, buffer), combinedCt);
+                        handedOff = true;
+                        metrics.TotalItems += count;
+                        metrics.ChunksCreated++;
+                        _options.OnProgress?.Invoke(SortPhase.ChunkCreation, -1);
+                    }
+                    finally
+                    {
+                        if (!handedOff) ReturnBuffer(buffer);
+                    }
                 }
             }
             finally
@@ -476,11 +501,10 @@ public sealed class ExternalSorter<T> : IExternalSorter<T>
         }
         catch (AggregateException ae)
         {
-            // Surface the first inner exception — preserving its original
-            // stack via ExceptionDispatchInfo — so the caller sees
-            // OperationCanceledException / IOException etc., not a generic
-            // AggregateException wrapper. Multiple distinct failures keep
-            // the aggregate.
+            ct.ThrowIfCancellationRequested();
+            var faults = ae.InnerExceptions.Where(e => e is not OperationCanceledException).ToList();
+            if (faults.Count == 1)
+                ExceptionDispatchInfo.Throw(faults[0]);
             if (ae.InnerExceptions.Count == 1)
                 ExceptionDispatchInfo.Throw(ae.InnerExceptions[0]);
             throw;
